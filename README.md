@@ -6,9 +6,9 @@ Recréation moderne de deux outils de la suite **Netman** (Curtin University,
 navigateur et alimentés par **une seule capture réseau**.
 
 - Backend **Rust** : capture Npcap, agrégation, serveur HTTP/WebSocket (axum).
-- Frontend **sigma.js v3** + graphology + ForceAtlas2 continu (web worker) —
-  les nœuds se placent dynamiquement à mesure que le trafic arrive, comme
-  l'Etherman d'origine.
+- Frontend **sigma.js v3** + graphology : Etherman dispose ses stations sur
+  un cercle (réseau L2 plat), Interman anime ses réseaux au ForceAtlas2
+  continu (web worker) — les nœuds se placent à mesure que le trafic arrive.
 - Outil **strictement passif** : capture et affichage, aucune injection.
 
 ## Prérequis
@@ -65,7 +65,10 @@ et le serveur.
 ## Interface
 
 - **Etherman (gauche)** : un nœud par adresse MAC (étiqueté fabricant via la
-  base OUI Wireshark embarquée), une arête par conversation L2.
+  base OUI Wireshark embarquée), une arête par conversation L2. Les nœuds
+  sont disposés **sur un grand cercle** — un réseau de niveau 2 est plat,
+  toutes les stations partagent le même segment ; les conversations
+  traversent le cercle, comme dans l'Etherman de 1993.
 - **Interman (droite)** : un nœud par adresse IP (v4/v6, y compris réseaux
   distants), renommé automatiquement dès que le reverse-DNS (PTR) aboutit ;
   une arête par conversation L3.

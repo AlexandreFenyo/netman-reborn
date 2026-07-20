@@ -93,7 +93,14 @@ const SIGMA_SETTINGS = {
 /* --- Deux vues indépendantes : graphe graphology + sigma + supervisor FA2. */
 
 class GraphView {
-  constructor(containerId) {
+  /* mode "force"  : ForceAtlas2 continu (Interman — plusieurs réseaux,
+   *                 la topologie émerge des forces) ;
+   * mode "circle" : nœuds répartis sur un grand cercle (Etherman — un
+   *                 réseau L2 est plat, toutes les stations sont sur le même
+   *                 segment ; les conversations traversent le cercle, comme
+   *                 dans l'Etherman de 1993). */
+  constructor(containerId, mode = "force") {
+    this.mode = mode;
     this.graph = new graphology.Graph();
     this.renderer = new Sigma(this.graph, document.getElementById(containerId), SIGMA_SETTINGS);
     this.layout = null;
@@ -102,11 +109,25 @@ class GraphView {
   /* FA2 refuse un graphe vide : démarrage paresseux au premier nœud.
    * Le supervisor tolère les mutations à chaud (respawn debouncé du worker). */
   ensureLayout() {
-    if (this.layout || this.graph.order === 0) return;
+    if (this.mode !== "force" || this.layout || this.graph.order === 0) return;
     const settings = graphologyLibrary.layoutForceAtlas2.inferSettings(this.graph);
     settings.slowDown = 5; /* placement plus stable pour un graphe vivant */
     this.layout = new graphologyLibrary.FA2Layout(this.graph, { settings });
     this.layout.start();
+  }
+
+  /* Redistribue tous les nœuds uniformément sur le cercle. Tri par id (MAC) :
+   * placement déterministe et stable, et les préfixes constructeurs voisins
+   * se retrouvent naturellement côte à côte. */
+  circleLayout() {
+    const ids = this.graph.nodes().sort();
+    const radius = 100;
+    const count = ids.length;
+    ids.forEach((id, i) => {
+      const angle = (2 * Math.PI * i) / count - Math.PI / 2;
+      this.graph.setNodeAttribute(id, "x", radius * Math.cos(angle));
+      this.graph.setNodeAttribute(id, "y", radius * Math.sin(angle));
+    });
   }
 
   /* Position initiale près du barycentre des nœuds existants. */
@@ -137,15 +158,19 @@ class GraphView {
       proto,
     };
     /* sigma v3 exige x/y AU MOMENT de l'ajout : la position fait partie des
-     * attributs du merge. Jamais écrasée ensuite (FA2 la fait vivre). */
+     * attributs du merge. En mode force, jamais écrasée ensuite (FA2 la fait
+     * vivre) ; en mode cercle, le layout redistribue tout de suite. */
     const isNew = !this.graph.hasNode(id);
     if (isNew) {
-      const pos = this.spawnPosition();
+      const pos = this.mode === "circle" ? { x: 0, y: 0 } : this.spawnPosition();
       attrs.x = pos.x;
       attrs.y = pos.y;
     }
     this.graph.mergeNode(id, attrs);
-    if (isNew) this.ensureLayout();
+    if (isNew) {
+      if (this.mode === "circle") this.circleLayout();
+      else this.ensureLayout();
+    }
   }
 
   /* Garde-fou : si une arête arrive avant ses extrémités (delta de nœud
@@ -170,6 +195,7 @@ class GraphView {
 
   removeNode(id) {
     if (this.graph.hasNode(id)) this.graph.dropNode(id);
+    if (this.mode === "circle") this.circleLayout();
     if (this.graph.order === 0) this.resetLayout();
   }
 
@@ -191,8 +217,8 @@ class GraphView {
 }
 
 const views = {
-  ether: new GraphView("graph-ether"),
-  inter: new GraphView("graph-inter"),
+  ether: new GraphView("graph-ether", "circle"),
+  inter: new GraphView("graph-inter", "force"),
 };
 
 /* --- Application des deltas. */
