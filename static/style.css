@@ -127,7 +127,14 @@ body { display: flex; flex-direction: column; }
   accent-color: var(--accent);
 }
 
-.graph { flex: 1; min-height: 0; }
+.graph { flex: 1; min-height: 0; position: relative; }
+
+/* Calque des cercles-guides, sous les canvases sigma. */
+.graph canvas.guides {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
 
 /* Légende des couleurs de protocole (mapping visuel fixe). */
 #legend {

@@ -171,7 +171,8 @@ class GraphView {
      * recalcul d'attributs au changement de slider. */
     this.widthScale = 1;
     this.animFrame = null; /* animation de re-layout en cours */
-    this.renderer = new Sigma(this.graph, document.getElementById(containerId), {
+    const container = document.getElementById(containerId);
+    this.renderer = new Sigma(this.graph, container, {
       ...SIGMA_BASE_SETTINGS,
       nodeReducer: (_node, data) => {
         if (protoFilter && data.proto !== protoFilter) {
@@ -187,6 +188,43 @@ class GraphView {
       },
     });
     this.layout = null;
+    /* Calque des cercles-guides : un canvas SOUS les rendus sigma (premier
+     * enfant du conteneur), redessiné après chaque frame avec la caméra
+     * courante. Les layouts publient leurs cercles dans guideCircles. */
+    this.guideCircles = [];
+    this.guideCanvas = document.createElement("canvas");
+    this.guideCanvas.className = "guides";
+    container.insertBefore(this.guideCanvas, container.firstChild);
+    this.renderer.on("afterRender", () => this.drawGuides());
+  }
+
+  drawGuides() {
+    const canvas = this.guideCanvas;
+    const parent = canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    const w = parent.clientWidth;
+    const h = parent.clientHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "rgba(165, 175, 190, 0.22)"; /* gris clair, discret */
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 5]); /* pointillés */
+    for (const circle of this.guideCircles) {
+      const center = this.renderer.graphToViewport({ x: circle.cx, y: circle.cy });
+      const rim = this.renderer.graphToViewport({ x: circle.cx + circle.r, y: circle.cy });
+      const radius = Math.hypot(rim.x - center.x, rim.y - center.y);
+      if (radius < 3) continue;
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
   }
 
   /* FA2 refuse un graphe vide : démarrage paresseux au premier nœud.
@@ -245,6 +283,7 @@ class GraphView {
       const angle = (2 * Math.PI * i) / count - Math.PI / 2;
       targets[id] = { x: radius * Math.cos(angle), y: radius * Math.sin(angle) };
     });
+    this.guideCircles = count > 0 ? [{ cx: 0, cy: 0, r: radius }] : [];
     this.animateTo(targets);
   }
 
@@ -271,12 +310,14 @@ class GraphView {
         ? 0
         : Math.max(150, (networkCount * (2 * maxRadius + 50)) / (2 * Math.PI));
     const targets = {};
+    const guides = [];
     keys.forEach((key, ki) => {
       const centerAngle = (2 * Math.PI * ki) / networkCount - Math.PI / 2;
       const cx = ringRadius * Math.cos(centerAngle);
       const cy = ringRadius * Math.sin(centerAngle);
       const members = groups.get(key).sort(compareNodeIds);
       const radius = clusterRadius(members.length);
+      if (radius > 0) guides.push({ cx, cy, r: radius });
       members.forEach((id, i) => {
         const angle = (2 * Math.PI * i) / members.length - Math.PI / 2;
         targets[id] = {
@@ -285,6 +326,7 @@ class GraphView {
         };
       });
     });
+    this.guideCircles = guides;
     this.animateTo(targets);
   }
 
@@ -438,6 +480,7 @@ class GraphView {
       this.animFrame = null;
     }
     this.resetLayout();
+    this.guideCircles = [];
     this.graph.clear();
   }
 }
