@@ -1,0 +1,113 @@
+# Netman Reborn — Etherman + Interman
+
+Recréation moderne de deux outils de la suite **Netman** (Curtin University,
+1993) : **Etherman** (conversations couche 2, adresses MAC) et **Interman**
+(conversations couche 3, IPv4 + IPv6), affichés **côte à côte** dans le
+navigateur et alimentés par **une seule capture réseau**.
+
+- Backend **Rust** : capture Npcap, agrégation, serveur HTTP/WebSocket (axum).
+- Frontend **sigma.js v3** + graphology + ForceAtlas2 continu (web worker) —
+  les nœuds se placent dynamiquement à mesure que le trafic arrive, comme
+  l'Etherman d'origine.
+- Outil **strictement passif** : capture et affichage, aucune injection.
+
+## Prérequis
+
+- **Windows** (10/11). La capture est native Windows via **Npcap** — ne pas
+  exécuter depuis WSL2 (son réseau virtualisé ne voit pas le trafic
+  promiscuous de la carte physique).
+- **[Npcap](https://npcap.com/#download)** installé (options par défaut).
+  - Le mode « WinPcap API-compatible » n'est **pas** nécessaire : le binaire
+    charge `wpcap.dll` depuis `C:\Windows\System32\Npcap` (delay-load +
+    `SetDllDirectory`).
+  - Si l'option « Restrict Npcap driver's access to Administrators only » a
+    été cochée à l'installation de Npcap, lancez netman **en administrateur**.
+    Avec les options par défaut, aucune élévation n'est nécessaire.
+- Pour compiler : **Rust** (rustup, toolchain `stable-msvc`) + les Build Tools
+  Visual Studio (C++) + un Windows SDK. Le SDK Npcap (link) est vendorisé dans
+  `third_party/`, rien à configurer.
+
+## Build
+
+```powershell
+cargo build --release
+```
+
+Le binaire est `target\release\netman.exe`. Il sert le dossier `static\`
+(chemin réglable avec `--static-dir`), qui doit donc accompagner l'exécutable.
+
+## Exécution
+
+```powershell
+# Sélection interactive de l'interface (liste numérotée) :
+.\target\release\netman.exe
+
+# Ou directement, par index ou sous-chaîne du nom de l'interface :
+.\target\release\netman.exe --iface "Intel"
+.\target\release\netman.exe --iface 12
+
+# Rejouer un fichier .pcap (mode offline, sans carte réseau) :
+.\target\release\netman.exe --pcap-file capture.pcap
+
+# Options :
+#   --port <n>        port HTTP/WebSocket (défaut 8080)
+#   --fade <s>        délai initial de disparition des nœuds muets (défaut 60 s)
+#   --static-dir <d>  dossier du frontend (défaut "static")
+```
+
+Puis ouvrez **http://localhost:8080**. `Ctrl-C` arrête proprement la capture
+et le serveur.
+
+> Pour voir plus que votre propre trafic + broadcast/multicast sur un réseau
+> commuté, branchez la machine sur un port SPAN/miroir ou un TAP. C'est une
+> question d'infrastructure : l'outil reste passif par conception.
+
+## Interface
+
+- **Etherman (gauche)** : un nœud par adresse MAC (étiqueté fabricant via la
+  base OUI Wireshark embarquée), une arête par conversation L2.
+- **Interman (droite)** : un nœud par adresse IP (v4/v6, y compris réseaux
+  distants), renommé automatiquement dès que le reverse-DNS (PTR) aboutit ;
+  une arête par conversation L3.
+- **Mapping visuel** : taille de nœud et épaisseur d'arête ∝ log(octets
+  cumulés) ; couleur = protocole dominant (légende en pied de page).
+- **Contrôles** :
+  - *Pause / Resume* — gèle les deux vues (la capture continue ; la reprise
+    resynchronise sur l'état serveur) ;
+  - *Reset* — reconstruit les vues depuis l'état serveur courant ;
+  - *Protocol* — met en avant un protocole (les autres arêtes sont masquées,
+    les nœuds estompés) ;
+  - *Fade* — délai au bout duquel nœuds et arêtes silencieux disparaissent
+    (5 s → 10 min, synchronisé entre tous les onglets ouverts).
+- Molette = zoom, glisser = déplacement.
+
+## Architecture (résumé)
+
+```
+thread OS pcap (bloquant, promiscuous, une seule capture)
+  → parse etherparse → PacketMeta → channel (jamais bloquant côté capture)
+  → agrégateur tokio : table L2 (MAC,MAC) + table L3 (IP,IP), tick 250 ms
+  → deltas JSON atomiques (upsert/remove nœud/arête) → broadcast WebSocket
+  → navigateur : 2 × (graphology + sigma.js + ForceAtlas2 worker)
+```
+
+Résolutions (OUI, PTR) : best-effort, asynchrones, avec cache — jamais sur le
+chemin du paquet. Voir `RESEARCH.md` pour les versions figées et les choix
+d'API, et `CLAUDE.md` pour les invariants du projet.
+
+## Tests
+
+```powershell
+cargo test
+```
+
+Inclut le rejeu déterministe d'une fixture `.pcap`
+(`tests/fixtures/sample.pcap`, vérifiée octet à octet contre son générateur).
+
+## Mise à jour de la base OUI
+
+```powershell
+Invoke-WebRequest https://www.wireshark.org/download/automated/data/manuf `
+  -OutFile src\resolve\data\manuf
+cargo build --release
+```

@@ -4,18 +4,19 @@
  * Le backend envoie des mutations atomiques (contrat wsproto, CLAUDE.md §6) :
  *   { type: upsert_node|upsert_edge|remove_node|remove_edge,
  *     view: "ether"|"inter", id, [source, target,] bytes, packets, proto, label }
+ * plus { type: "config", fade_secs } (état des réglages, le serveur fait foi).
  * Le client APPLIQUE, il ne recalcule pas. bytes/packets sont des cumuls
  * absolus : un delta manqué est réparé par le suivant.
  *
- * Mapping visuel (fixe, documenté) :
- *   - taille de nœud  ∝ log2(octets cumulés)   [2 .. 18]
+ * Mapping visuel (fixe, documenté, légende en pied de page) :
+ *   - taille de nœud   ∝ log2(octets cumulés)  [2 .. 18]
  *   - épaisseur d'arête ∝ log2(octets cumulés) [0.5 .. 7]
- *   - couleur = protocole dominant (palette PROTO_COLORS ci-dessous)
+ *   - couleur = protocole dominant (palette PROTO_COLORS)
  */
 
 "use strict";
 
-/* Palette protocole → couleur (légende affichée au jalon 5). */
+/* Palette protocole → couleur. */
 const PROTO_COLORS = {
   IPv4: "#4c9be8",
   IPv6: "#8e6ee8",
@@ -39,8 +40,11 @@ const PROTO_COLORS = {
   NTP: "#95a5a6",
   IGMP: "#a04000",
 };
+const OTHER_COLOR = "#697386";
+const DIMMED_COLOR = "#2a3040";
+
 function protoColor(proto) {
-  return PROTO_COLORS[proto] || "#697386";
+  return PROTO_COLORS[proto] || OTHER_COLOR;
 }
 
 function nodeSize(bytes) {
@@ -51,17 +55,35 @@ function edgeSize(bytes) {
   return Math.min(7, Math.max(0.5, 0.5 + Math.log2(1 + bytes) * 0.35));
 }
 
-/* --- Deux vues indépendantes : graphe graphology + sigma + supervisor FA2. */
+/* --- Filtre protocole (piloté par le <select>, appliqué via les reducers
+ * sigma : les arêtes d'un autre protocole sont masquées, leurs nœuds
+ * estompés — aucune mutation des graphes, purement visuel). */
+
+let protoFilter = "";
 
 const SIGMA_SETTINGS = {
   labelColor: { color: "#aeb6c4" },
   labelSize: 11,
   labelRenderedSizeThreshold: 5,
-  defaultNodeColor: "#697386",
+  defaultNodeColor: OTHER_COLOR,
   defaultEdgeColor: "#333a48",
   minCameraRatio: 0.05,
   maxCameraRatio: 20,
+  nodeReducer: (_node, data) => {
+    if (protoFilter && data.proto !== protoFilter) {
+      return { ...data, color: DIMMED_COLOR, label: null, size: Math.min(data.size, 3) };
+    }
+    return data;
+  },
+  edgeReducer: (_edge, data) => {
+    if (protoFilter && data.proto !== protoFilter) {
+      return { ...data, hidden: true };
+    }
+    return data;
+  },
 };
+
+/* --- Deux vues indépendantes : graphe graphology + sigma + supervisor FA2. */
 
 class GraphView {
   constructor(containerId) {
@@ -80,9 +102,7 @@ class GraphView {
     this.layout.start();
   }
 
-  /* Position initiale OBLIGATOIRE (sinon NaN se propage dans tout le layout).
-   * Les nouveaux nœuds apparaissent près du barycentre des existants pour
-   * éviter les vols planés à travers l'écran. */
+  /* Position initiale près du barycentre des nœuds existants. */
   spawnPosition() {
     const order = this.graph.order;
     if (order === 0) return { x: 0, y: 0 };
@@ -100,6 +120,7 @@ class GraphView {
   }
 
   upsertNode(id, label, bytes, packets, proto) {
+    registerProto(proto);
     const attrs = {
       label,
       size: nodeSize(bytes),
@@ -108,9 +129,8 @@ class GraphView {
       packets,
       proto,
     };
-    /* sigma v3 exige x/y AU MOMENT de l'ajout (sinon il lève une erreur) :
-     * la position doit faire partie des attributs du merge, jamais être
-     * posée après coup. Jamais écrasée sur un nœud existant (FA2 la gère). */
+    /* sigma v3 exige x/y AU MOMENT de l'ajout : la position fait partie des
+     * attributs du merge. Jamais écrasée ensuite (FA2 la fait vivre). */
     const isNew = !this.graph.hasNode(id);
     if (isNew) {
       const pos = this.spawnPosition();
@@ -122,14 +142,14 @@ class GraphView {
   }
 
   /* Garde-fou : si une arête arrive avant ses extrémités (delta de nœud
-   * perdu par lag), on crée le nœud avec une position valide — l'upsert
-   * de nœud suivant complétera label/taille/couleur. */
+   * sauté par lag), on crée le nœud — l'upsert suivant le complétera. */
   ensureEndpoint(id) {
     if (this.graph.hasNode(id)) return;
     this.upsertNode(id, id, 0, 0, "?");
   }
 
   upsertEdge(id, source, target, bytes, packets, proto) {
+    registerProto(proto);
     this.ensureEndpoint(source);
     this.ensureEndpoint(target);
     this.graph.mergeEdgeWithKey(id, source, target, {
@@ -187,25 +207,56 @@ function applyDelta(delta) {
       view.removeEdge(delta.id);
       break;
     default:
-      console.warn("unknown delta type", delta);
+      console.warn("unknown message type", delta);
   }
 }
 
-/* --- Connexion WebSocket avec reconnexion (backoff progressif).
- * À chaque (re)connexion le serveur envoie un snapshot complet : on repart
- * de graphes vides pour éliminer toute entrée périmée. */
+/* --- Contrôles. */
 
 const statusEl = document.getElementById("status");
-const debugEl = document.getElementById("debug");
+const pauseEl = document.getElementById("pause");
+const resetEl = document.getElementById("reset");
+const filterEl = document.getElementById("filter");
 const fadeEl = document.getElementById("fade");
 const fadeValueEl = document.getElementById("fade-value");
 let socket = null;
-let reconnectDelay = 500;
-let msgCount = 0;
-let lastError = "";
+let paused = false;
 
-/* --- Réglage du fade : slider → serveur ; le serveur renvoie {type:"config"}
- * à tous les clients (y compris l'émetteur), qui fait foi. */
+/* Pause : gèle les deux vues (les deltas sont ignorés). La reprise force une
+ * reconnexion → le snapshot serveur remet les vues exactement à jour. */
+pauseEl.addEventListener("click", () => {
+  paused = !paused;
+  pauseEl.textContent = paused ? "Resume" : "Pause";
+  pauseEl.classList.toggle("active", paused);
+  if (!paused && socket) socket.close();
+});
+
+/* Reset : repart de zéro à partir du snapshot serveur. */
+resetEl.addEventListener("click", () => {
+  if (socket) socket.close();
+});
+
+/* Filtre protocole : la liste se remplit au fil des protocoles rencontrés. */
+const seenProtos = new Set();
+
+function registerProto(proto) {
+  if (!proto || proto === "?" || seenProtos.has(proto)) return;
+  seenProtos.add(proto);
+  const option = document.createElement("option");
+  option.value = proto;
+  option.textContent = proto;
+  filterEl.appendChild(option);
+}
+
+filterEl.addEventListener("change", () => {
+  protoFilter = filterEl.value;
+  for (const view of Object.values(views)) {
+    view.renderer.refresh({ skipIndexation: true });
+  }
+});
+
+/* Réglage du fade : slider → serveur ; le serveur renvoie {type:"config"} à
+ * tous les clients (y compris l'émetteur), qui fait foi. */
 
 function fadeLabel(seconds) {
   return seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
@@ -226,18 +277,27 @@ function applyConfig(config) {
   fadeValueEl.textContent = fadeLabel(config.fade_secs);
 }
 
-window.addEventListener("error", (e) => {
-  lastError = e.message;
-});
+/* --- Légende. */
 
-function refreshDebug() {
-  const e = views.ether.graph;
-  const i = views.inter.graph;
-  debugEl.textContent =
-    `msgs ${msgCount} | ether ${e.order}n/${e.size}e | inter ${i.order}n/${i.size}e` +
-    (lastError ? ` | ERR: ${lastError}` : "");
+{
+  const legend = document.getElementById("legend");
+  const entries = { ...PROTO_COLORS, other: OTHER_COLOR };
+  for (const [proto, color] of Object.entries(entries)) {
+    const item = document.createElement("span");
+    item.className = "legend-item";
+    const dot = document.createElement("span");
+    dot.className = "legend-dot";
+    dot.style.background = color;
+    item.append(dot, proto);
+    legend.appendChild(item);
+  }
 }
-setInterval(refreshDebug, 1000);
+
+/* --- Connexion WebSocket avec reconnexion (backoff progressif).
+ * À chaque (re)connexion le serveur envoie config + snapshot complet : on
+ * repart de graphes vides pour éliminer toute entrée périmée. */
+
+let reconnectDelay = 500;
 
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -245,28 +305,32 @@ function connect() {
 
   ws.onopen = () => {
     reconnectDelay = 500;
-    statusEl.textContent = "live";
-    statusEl.className = "connected";
-    for (const view of Object.values(views)) view.clear();
+    statusEl.textContent = paused ? "paused" : "live";
+    statusEl.className = paused ? "disconnected" : "connected";
+    /* En pause, on garde la vue gelée : le clear + snapshot se feront à la
+     * reprise (Resume ferme la socket → reconnexion propre). */
+    if (!paused) {
+      for (const view of Object.values(views)) view.clear();
+    }
   };
 
   ws.onmessage = (event) => {
-    msgCount++;
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === "config") {
         applyConfig(msg);
-      } else {
+      } else if (!paused) {
         applyDelta(msg);
       }
     } catch (e) {
-      lastError = e.message;
       console.error("bad message", e, event.data);
     }
   };
 
   ws.onclose = () => {
-    statusEl.textContent = `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`;
+    statusEl.textContent = paused
+      ? "paused"
+      : `disconnected — retrying in ${Math.round(reconnectDelay / 1000)}s`;
     statusEl.className = "disconnected";
     setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);

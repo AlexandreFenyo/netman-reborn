@@ -154,6 +154,27 @@ let s = SlicedPacket::from_ethernet(data)?; // fallback: LaxSlicedPacket
 - Alternatives écartées : crate `oui` 0.8.1 (2021, mort), `mac_oui` 0.4.11
   (données figées à la publication, ~2024).
 
+## Compléments (jalon 5)
+
+- **Reverse-DNS (PTR)** : crate `dns-lookup` 2.x (`lookup_addr` =
+  `getnameinfo`, résolveur système Windows) sur le pool bloquant tokio,
+  concurrence bornée (8), plutôt que `hickory-resolver` (API async complète
+  mais dépendance lourde pour un simple PTR best-effort). Détection du
+  négatif : `getnameinfo` renvoie la forme numérique quand il n'y a pas de
+  PTR. Cache de session : une tentative par IP (succès et échecs), noms
+  conservés dans `Tables::l3_labels` (survivent au fade).
+- **Contrat WS étendu** (backend + frontend même commit) :
+  `{"type":"set_fade","seconds":N}` (client→serveur) et
+  `{"type":"config","fade_secs":N}` (serveur→client, à la connexion et à
+  chaque changement — le serveur fait foi, tous les onglets se synchronisent).
+- **OUI embarqué** : `manuf` Wireshark du 2026-07-20 (3,1 Mo), parse paresseux
+  (`OnceLock`) en trois maps /24 (MA-L), /28 (MA-M), /36 (MA-S), lookup
+  /36→/28→/24. Les MAC localement administrées (bit U/L) sont exclues par
+  construction. Étiquette Etherman : `Fabricant xx:yy:zz`.
+- **Piège sigma v3 rencontré** : un nœud DOIT avoir `x`/`y` dans les attributs
+  passés à `mergeNode` — les poser après coup via `setNodeAttribute` lève
+  `Sigma: could not find a valid position`. (Consigné aussi dans app.js.)
+
 ## Décisions transverses
 
 - Une seule capture, deux projections (invariant 1) : le thread pcap produit un

@@ -33,12 +33,34 @@ body { display: flex; flex-direction: column; }
 #title { font-size: 1.05rem; font-weight: 600; letter-spacing: 0.03em; }
 #title em { color: var(--accent); font-style: normal; }
 
-#fade-control {
+#topbar button {
+  background: transparent;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 0.8rem;
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+}
+
+#topbar button:hover { border-color: var(--accent); }
+#topbar button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+#filter-control, #fade-control {
   display: flex;
   align-items: center;
   gap: 0.45rem;
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+#filter-control select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  padding: 0.2rem 0.35rem;
 }
 
 #fade-control input[type="range"] {
@@ -52,8 +74,7 @@ body { display: flex; flex-direction: column; }
   font-variant-numeric: tabular-nums;
 }
 
-#debug { margin-left: auto; font-size: 0.75rem; color: var(--muted); }
-#status { font-size: 0.8rem; }
+#status { margin-left: auto; font-size: 0.8rem; }
 #status.connected { color: #2ecc71; }
 #status.disconnected { color: #e74c3c; }
 
@@ -85,3 +106,24 @@ body { display: flex; flex-direction: column; }
 }
 
 .graph { flex: 1; min-height: 0; }
+
+/* Légende des couleurs de protocole (mapping visuel fixe). */
+#legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
+  padding: 0.35rem 0.9rem;
+  border-top: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.legend-item { display: flex; align-items: center; gap: 0.35rem; }
+
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}

@@ -146,8 +146,12 @@ impl Tables {
         );
         for mac in std::mem::take(&mut self.dirty_l2_nodes) {
             if let Some(stats) = self.l2_nodes.get(&mac) {
-                let id = mac.to_string();
-                out.push(node_delta(View::Ether, id.clone(), id, stats));
+                out.push(node_delta(
+                    View::Ether,
+                    mac.to_string(),
+                    crate::resolve::oui::label(&mac),
+                    stats,
+                ));
             }
         }
         for ip in std::mem::take(&mut self.dirty_l3_nodes) {
@@ -281,8 +285,12 @@ impl Tables {
             self.l2_nodes.len() + self.l3_nodes.len() + self.l2.len() + self.l3.len(),
         );
         for (mac, stats) in &self.l2_nodes {
-            let id = mac.to_string();
-            out.push(node_delta(View::Ether, id.clone(), id, stats));
+            out.push(node_delta(
+                View::Ether,
+                mac.to_string(),
+                crate::resolve::oui::label(mac),
+                stats,
+            ));
         }
         for (ip, stats) in &self.l3_nodes {
             out.push(node_delta(

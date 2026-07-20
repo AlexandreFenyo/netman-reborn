@@ -9,12 +9,17 @@
 <body>
   <header id="topbar">
     <span id="title">Netman <em>Reborn</em></span>
+    <button id="pause" title="Freeze both views (traffic keeps being captured)">Pause</button>
+    <button id="reset" title="Clear both views and rebuild from the current server state">Reset</button>
+    <label id="filter-control" title="Highlight a single protocol">
+      Protocol
+      <select id="filter"><option value="">All protocols</option></select>
+    </label>
     <label id="fade-control" title="Nodes and their links disappear after this many seconds without traffic">
       Fade
       <input type="range" id="fade" min="5" max="600" step="5" value="60">
       <span id="fade-value">60&nbsp;s</span>
     </label>
-    <span id="debug"></span>
     <span id="status" class="disconnected">connecting…</span>
   </header>
   <main id="panels">
@@ -27,6 +32,7 @@
       <div id="graph-inter" class="graph"></div>
     </section>
   </main>
+  <footer id="legend"></footer>
   <script src="vendor/graphology.umd.min.js"></script>
   <script src="vendor/graphology-library.min.js"></script>
   <script src="vendor/sigma.min.js"></script>
