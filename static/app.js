@@ -170,6 +170,7 @@ class GraphView {
      * panneau. Appliquée dans l'edgeReducer : purement visuel, aucun
      * recalcul d'attributs au changement de slider. */
     this.widthScale = 1;
+    this.animFrame = null; /* animation de re-layout en cours */
     this.renderer = new Sigma(this.graph, document.getElementById(containerId), {
       ...SIGMA_BASE_SETTINGS,
       nodeReducer: (_node, data) => {
@@ -198,6 +199,40 @@ class GraphView {
     this.layout.start();
   }
 
+  /* Déplacement fluide vers des positions cibles (ease-out cubic, ~600 ms).
+   * Les nœuds encore jamais placés (fraîchement apparus) vont directement à
+   * leur cible — pas de traversée d'écran ; les autres glissent. Un nouveau
+   * re-layout pendant l'animation repart des positions courantes : pas
+   * d'à-coup. */
+  animateTo(targets, duration = 600) {
+    if (this.animFrame) cancelAnimationFrame(this.animFrame);
+    const from = {};
+    for (const [id, target] of Object.entries(targets)) {
+      if (!this.graph.hasNode(id)) continue;
+      const attrs = this.graph.getNodeAttributes(id);
+      if (!attrs.placed) {
+        this.graph.mergeNode(id, { x: target.x, y: target.y, placed: true });
+      } else {
+        from[id] = { x: attrs.x, y: attrs.y };
+      }
+    }
+    const start = performance.now();
+    const step = (nowMs) => {
+      const t = Math.min((nowMs - start) / duration, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      for (const [id, origin] of Object.entries(from)) {
+        if (!this.graph.hasNode(id)) continue;
+        const target = targets[id];
+        this.graph.mergeNode(id, {
+          x: origin.x + (target.x - origin.x) * eased,
+          y: origin.y + (target.y - origin.y) * eased,
+        });
+      }
+      this.animFrame = t < 1 ? requestAnimationFrame(step) : null;
+    };
+    this.animFrame = requestAnimationFrame(step);
+  }
+
   /* Redistribue tous les nœuds uniformément sur le cercle. Tri par id (MAC) :
    * placement déterministe et stable, et les préfixes constructeurs voisins
    * se retrouvent naturellement côte à côte. */
@@ -205,11 +240,12 @@ class GraphView {
     const ids = this.graph.nodes().sort();
     const radius = 100;
     const count = ids.length;
+    const targets = {};
     ids.forEach((id, i) => {
       const angle = (2 * Math.PI * i) / count - Math.PI / 2;
-      this.graph.setNodeAttribute(id, "x", radius * Math.cos(angle));
-      this.graph.setNodeAttribute(id, "y", radius * Math.sin(angle));
+      targets[id] = { x: radius * Math.cos(angle), y: radius * Math.sin(angle) };
     });
+    this.animateTo(targets);
   }
 
   /* Un cercle par réseau, les centres des réseaux répartis sur un anneau
@@ -234,6 +270,7 @@ class GraphView {
       networkCount === 1
         ? 0
         : Math.max(150, (networkCount * (2 * maxRadius + 50)) / (2 * Math.PI));
+    const targets = {};
     keys.forEach((key, ki) => {
       const centerAngle = (2 * Math.PI * ki) / networkCount - Math.PI / 2;
       const cx = ringRadius * Math.cos(centerAngle);
@@ -242,10 +279,13 @@ class GraphView {
       const radius = clusterRadius(members.length);
       members.forEach((id, i) => {
         const angle = (2 * Math.PI * i) / members.length - Math.PI / 2;
-        this.graph.setNodeAttribute(id, "x", cx + radius * Math.cos(angle));
-        this.graph.setNodeAttribute(id, "y", cy + radius * Math.sin(angle));
+        targets[id] = {
+          x: cx + radius * Math.cos(angle),
+          y: cy + radius * Math.sin(angle),
+        };
       });
     });
+    this.animateTo(targets);
   }
 
   /* Applique le layout du mode courant après une mutation de topologie. */
@@ -393,6 +433,10 @@ class GraphView {
   }
 
   clear() {
+    if (this.animFrame) {
+      cancelAnimationFrame(this.animFrame);
+      this.animFrame = null;
+    }
     this.resetLayout();
     this.graph.clear();
   }
