@@ -60,6 +60,9 @@ pub enum ClientCommand {
     SetFade { seconds: u64 },
     /// Bascule la capture sur une autre interface (id = nom NPF).
     SetInterface { id: String },
+    /// Efface l'historique des conversations et nœuds (comme si aucun paquet
+    /// n'avait été reçu) — les caches de résolution DNS sont conservés.
+    Reset,
 }
 
 /// Interface de capture présentée au client.
@@ -82,6 +85,8 @@ pub enum ServerInfo {
         current: Option<String>,
         interfaces: Vec<IfaceInfo>,
     },
+    /// L'historique vient d'être effacé : les clients vident leurs vues.
+    Reset,
 }
 
 #[cfg(test)]
@@ -139,6 +144,13 @@ mod tests {
         let cmd: ClientCommand =
             serde_json::from_str(r#"{"type":"set_fade","seconds":120}"#).unwrap();
         assert_eq!(cmd, ClientCommand::SetFade { seconds: 120 });
+
+        let cmd: ClientCommand = serde_json::from_str(r#"{"type":"reset"}"#).unwrap();
+        assert_eq!(cmd, ClientCommand::Reset);
+        assert_eq!(
+            serde_json::to_string(&ServerInfo::Reset).unwrap(),
+            r#"{"type":"reset"}"#
+        );
 
         let cmd: ClientCommand =
             serde_json::from_str(r#"{"type":"set_interface","id":"\\Device\\NPF_{X}"}"#).unwrap();

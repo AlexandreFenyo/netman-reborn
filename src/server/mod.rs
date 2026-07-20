@@ -102,6 +102,10 @@ fn handle_client_command(text: &str, state: &AppState) {
                 let _ = state.deltas_tx.send(msg);
             }
         }
+        Ok(ClientCommand::Reset) => {
+            reset_history(&state.tables, &state.deltas_tx);
+            tracing::info!("history reset by client");
+        }
         Ok(ClientCommand::SetInterface { id }) => match &state.iface_tx {
             Some(tx) => {
                 if tx.try_send(id).is_err() {
@@ -111,6 +115,18 @@ fn handle_client_command(text: &str, state: &AppState) {
             None => tracing::warn!("interface switch requested in offline mode, ignored"),
         },
         Err(e) => tracing::warn!(error = %e, text, "unrecognized client message"),
+    }
+}
+
+/// Efface l'historique des tables (les caches DNS survivent — voir
+/// `Tables::reset`) et notifie tous les clients de vider leurs vues.
+/// Utilisé par la commande Reset ET lors d'un changement d'interface.
+pub fn reset_history(tables: &Arc<Mutex<Tables>>, deltas_tx: &broadcast::Sender<Utf8Bytes>) {
+    if let Ok(mut tables) = tables.lock() {
+        tables.reset();
+    }
+    if let Some(msg) = encode_info(&ServerInfo::Reset) {
+        let _ = deltas_tx.send(msg);
     }
 }
 

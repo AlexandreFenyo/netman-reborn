@@ -184,6 +184,7 @@ async fn async_main(
             iface_rx,
             ctl,
             Arc::clone(&iface_state),
+            Arc::clone(&tables),
             deltas_tx.clone(),
         ));
         iface_tx
@@ -220,13 +221,18 @@ async fn iface_switch_loop(
     mut iface_rx: mpsc::Receiver<String>,
     ctl: Arc<capture::Controller>,
     iface_state: Arc<Mutex<IfaceState>>,
+    tables: Arc<Mutex<Tables>>,
     deltas_tx: broadcast::Sender<Utf8Bytes>,
 ) {
     while let Some(wanted) = iface_rx.recv().await {
         let ctl_for_switch = Arc::clone(&ctl);
         let switched = tokio::task::spawn_blocking(move || ctl_for_switch.switch_to(&wanted)).await;
         match switched {
-            Ok(Ok(label)) => tracing::info!(label, "capture switched by client"),
+            Ok(Ok(label)) => {
+                tracing::info!(label, "capture switched by client");
+                // Nouvelle interface ⇒ historique vierge (caches DNS gardés).
+                server::reset_history(&tables, &deltas_tx);
+            }
             Ok(Err(e)) => tracing::warn!(error = %e, "interface switch failed"),
             Err(e) => tracing::error!(error = %e, "interface switch task failed"),
         }

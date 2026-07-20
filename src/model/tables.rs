@@ -229,6 +229,20 @@ impl Tables {
         self.dirty_l3_nodes.iter().copied().collect()
     }
 
+    /// Efface tout l'historique (comme si aucun paquet n'avait été reçu),
+    /// en CONSERVANT les caches de résolution (labels DNS `l3_labels`) :
+    /// une IP déjà résolue réaffiche son nom dès son premier nouveau paquet.
+    pub fn reset(&mut self) {
+        self.l2.clear();
+        self.l3.clear();
+        self.l2_nodes.clear();
+        self.l3_nodes.clear();
+        self.dirty_l2.clear();
+        self.dirty_l3.clear();
+        self.dirty_l2_nodes.clear();
+        self.dirty_l3_nodes.clear();
+    }
+
     /// Vieillissement (invariant 7) : retire les conversations et nœuds non
     /// revus depuis `max_age` et produit les deltas `remove_*` explicites.
     /// Arêtes d'abord, puis nœuds (un nœud périmé implique que toutes ses
@@ -560,6 +574,52 @@ mod tests {
         );
         let deltas = tables.drain_deltas();
         assert_eq!(label_of(&deltas, "10.0.0.1").unwrap(), "nas.local");
+    }
+
+    #[test]
+    fn reset_wipes_history_but_keeps_dns_cache() {
+        use crate::wsproto::Delta;
+        let mut tables = Tables::new();
+        let now = Instant::now();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                100,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            now,
+        );
+        tables.set_l3_label(ip_a, "nas.local".into());
+        tables.reset();
+
+        assert!(tables.l2.is_empty() && tables.l3.is_empty());
+        assert!(tables.l2_nodes.is_empty() && tables.l3_nodes.is_empty());
+        assert!(tables.drain_deltas().is_empty(), "plus rien de dirty");
+        assert!(tables.snapshot_deltas().is_empty());
+
+        // Le cache DNS survit : le nom réapparaît au premier nouveau paquet.
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                10,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            now,
+        );
+        let label = tables.drain_deltas().iter().find_map(|d| match d {
+            Delta::UpsertNode { id, label, .. } if id == "10.0.0.1" => Some(label.clone()),
+            _ => None,
+        });
+        assert_eq!(label.unwrap(), "nas.local");
+        // Et les compteurs sont bien repartis de zéro.
+        assert_eq!(tables.l3_nodes[&ip_a].bytes, 10);
     }
 
     #[test]

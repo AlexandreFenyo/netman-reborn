@@ -90,7 +90,9 @@ et le serveur.
 - **Contrôles** :
   - *Pause / Resume* — gèle les deux vues (la capture continue ; la reprise
     resynchronise sur l'état serveur) ;
-  - *Reset* — reconstruit les vues depuis l'état serveur courant ;
+  - *Reset* — efface l'historique des nœuds et liens côté serveur (comme si
+    aucun paquet n'avait été reçu), en conservant les caches DNS ; un reset
+    est aussi déclenché automatiquement au changement d'interface ;
   - *Rates* (actif par défaut) — affiche sur chaque lien le débit moyen
     bidirectionnel (unité adaptée : bit/s, kbit/s, Mbit/s, Gbit/s), calculé
     entre le premier et le dernier paquet observés depuis que le lien est

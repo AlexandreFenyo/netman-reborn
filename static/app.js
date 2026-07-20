@@ -559,9 +559,14 @@ pauseEl.addEventListener("click", () => {
   if (!paused && socket) socket.close();
 });
 
-/* Reset : repart de zéro à partir du snapshot serveur. */
+/* Reset : efface l'historique CÔTÉ SERVEUR (comme si aucun paquet n'avait
+ * été reçu) — les caches DNS sont conservés. Le serveur notifie tous les
+ * clients, qui vident leurs vues. Un reset est aussi déclenché par le
+ * serveur à chaque changement d'interface. */
 resetEl.addEventListener("click", () => {
-  if (socket) socket.close();
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "reset" }));
+  }
 });
 
 /* Filtre protocole : la liste se remplit au fil des protocoles rencontrés. */
@@ -747,6 +752,9 @@ function connect() {
         applyConfig(msg);
       } else if (msg.type === "interfaces") {
         applyInterfaces(msg);
+      } else if (msg.type === "reset") {
+        /* Historique serveur effacé : effet global immédiat, même en pause. */
+        for (const view of Object.values(views)) view.clear();
       } else if (!paused) {
         applyDelta(msg);
       }
