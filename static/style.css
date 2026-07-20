@@ -145,3 +145,21 @@ body { display: flex; flex-direction: column; }
   border-radius: 50%;
   display: inline-block;
 }
+
+/* Tooltip de survol des nœuds (identité + débits in/out). */
+#tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  background: #1a2029f2;
+  border: 1px solid var(--panel-border);
+  border-radius: 5px;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--fg);
+  max-width: 340px;
+  white-space: nowrap;
+}
+
+#tooltip strong { color: var(--accent); }

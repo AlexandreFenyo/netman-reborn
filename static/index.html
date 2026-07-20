@@ -11,6 +11,7 @@
     <span id="title">Netman <em>Reborn</em></span>
     <button id="pause" title="Freeze both views (traffic keeps being captured)">Pause</button>
     <button id="reset" title="Clear both views and rebuild from the current server state">Reset</button>
+    <button id="rates" title="Show the average two-way rate on every link">Rates</button>
     <label id="filter-control" title="Highlight a single protocol">
       Protocol
       <select id="filter"><option value="">All protocols</option></select>
@@ -43,6 +44,7 @@
     </section>
   </main>
   <footer id="legend"></footer>
+  <div id="tooltip" hidden></div>
   <script src="vendor/graphology.umd.min.js"></script>
   <script src="vendor/graphology-library.min.js"></script>
   <script src="vendor/sigma.min.js"></script>

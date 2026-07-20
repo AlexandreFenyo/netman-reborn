@@ -47,6 +47,10 @@ impl L3Key {
 pub struct ConvStats {
     pub bytes: u64,
     pub packets: u64,
+    /// Octets émis / reçus par ce nœud (perspective du nœud ; reste à 0 pour
+    /// une arête, dont `bytes` couvre déjà les deux sens).
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
     pub last_seen: Instant,
     /// Octets par protocole, pour déterminer le protocole dominant.
     proto_bytes: HashMap<Proto, u64>,
@@ -57,6 +61,8 @@ impl ConvStats {
         ConvStats {
             bytes: 0,
             packets: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
             last_seen: now,
             proto_bytes: HashMap::new(),
         }
@@ -110,11 +116,17 @@ impl Tables {
             .or_insert_with(|| ConvStats::new(now))
             .add(meta.wire_len, meta.l2_proto, now);
         self.dirty_l2.insert(l2_key);
-        for mac in [meta.src_mac, meta.dst_mac] {
-            self.l2_nodes
+        for (mac, is_src) in [(meta.src_mac, true), (meta.dst_mac, false)] {
+            let node = self
+                .l2_nodes
                 .entry(mac)
-                .or_insert_with(|| ConvStats::new(now))
-                .add(meta.wire_len, meta.l2_proto, now);
+                .or_insert_with(|| ConvStats::new(now));
+            node.add(meta.wire_len, meta.l2_proto, now);
+            if is_src {
+                node.tx_bytes += meta.wire_len;
+            } else {
+                node.rx_bytes += meta.wire_len;
+            }
             self.dirty_l2_nodes.insert(mac);
         }
 
@@ -125,11 +137,17 @@ impl Tables {
                 .or_insert_with(|| ConvStats::new(now))
                 .add(meta.wire_len, l3.proto, now);
             self.dirty_l3.insert(l3_key);
-            for ip in [l3.src, l3.dst] {
-                self.l3_nodes
+            for (ip, is_src) in [(l3.src, true), (l3.dst, false)] {
+                let node = self
+                    .l3_nodes
                     .entry(ip)
-                    .or_insert_with(|| ConvStats::new(now))
-                    .add(meta.wire_len, l3.proto, now);
+                    .or_insert_with(|| ConvStats::new(now));
+                node.add(meta.wire_len, l3.proto, now);
+                if is_src {
+                    node.tx_bytes += meta.wire_len;
+                } else {
+                    node.rx_bytes += meta.wire_len;
+                }
                 self.dirty_l3_nodes.insert(ip);
             }
         }
@@ -347,6 +365,8 @@ fn node_delta(view: View, id: String, label: String, stats: &ConvStats) -> Delta
         id,
         label,
         bytes: stats.bytes,
+        bytes_in: stats.rx_bytes,
+        bytes_out: stats.tx_bytes,
         packets: stats.packets,
         proto: stats.dominant_proto().to_string(),
     }
@@ -412,6 +432,14 @@ mod tests {
         let conv = &tables.l2[&L2Key::new(MAC_A, MAC_B)];
         assert_eq!(conv.bytes, 150);
         assert_eq!(conv.packets, 2);
+
+        // Compteurs directionnels des nœuds : A a émis 100 et reçu 50.
+        let node_a = &tables.l2_nodes[&MAC_A];
+        assert_eq!((node_a.tx_bytes, node_a.rx_bytes), (100, 50));
+        let node_b = &tables.l2_nodes[&MAC_B];
+        assert_eq!((node_b.tx_bytes, node_b.rx_bytes), (50, 100));
+        let ip_node_a = &tables.l3_nodes[&ip_a];
+        assert_eq!((ip_node_a.tx_bytes, ip_node_a.rx_bytes), (100, 50));
     }
 
     #[test]

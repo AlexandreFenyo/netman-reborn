@@ -26,6 +26,10 @@ pub enum Delta {
         id: String,
         label: String,
         bytes: u64,
+        /// Octets entrés dans l'hôte (il est destination).
+        bytes_in: u64,
+        /// Octets sortis de l'hôte (il est source).
+        bytes_out: u64,
         packets: u64,
         proto: String,
     },
@@ -76,12 +80,14 @@ mod tests {
             id: "aa:bb:cc:dd:ee:ff".into(),
             label: "aa:bb:cc:dd:ee:ff".into(),
             bytes: 1500,
+            bytes_in: 600,
+            bytes_out: 900,
             packets: 10,
             proto: "IPv4".into(),
         };
         assert_eq!(
             serde_json::to_string(&node).unwrap(),
-            r#"{"type":"upsert_node","view":"ether","id":"aa:bb:cc:dd:ee:ff","label":"aa:bb:cc:dd:ee:ff","bytes":1500,"packets":10,"proto":"IPv4"}"#
+            r#"{"type":"upsert_node","view":"ether","id":"aa:bb:cc:dd:ee:ff","label":"aa:bb:cc:dd:ee:ff","bytes":1500,"bytes_in":600,"bytes_out":900,"packets":10,"proto":"IPv4"}"#
         );
 
         let edge = Delta::UpsertEdge {
@@ -127,6 +133,8 @@ mod tests {
                 id: "fe80::1".into(),
                 label: "fe80::1".into(),
                 bytes: 0,
+                bytes_in: 0,
+                bytes_out: 0,
                 packets: 0,
                 proto: "mDNS".into(),
             },

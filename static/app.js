@@ -73,6 +73,26 @@ function edgeWidth(rate, scale) {
   return Math.min(12, 0.4 + 0.35 * scale * Math.log2(1 + rate / 100));
 }
 
+/* Débit en bit/s, unité adaptée : bit/s < 1 kbit/s < 1 Mbit/s < 1 Gbit/s. */
+function formatRate(bytesPerSec) {
+  const bps = bytesPerSec * 8;
+  if (bps < 1000) return `${Math.round(bps)} bit/s`;
+  if (bps < 1e6) return `${(bps / 1000).toFixed(1)} kbit/s`;
+  if (bps < 1e9) return `${(bps / 1e6).toFixed(1)} Mbit/s`;
+  return `${(bps / 1e9).toFixed(2)} Gbit/s`;
+}
+
+/* Débit moyen depuis que l'élément est affiché (baseline posée à sa
+ * création côté client ; plancher 1 s pour éviter la division par ~0). */
+function avgRate(currentBytes, firstBytes, firstTime, now) {
+  const elapsed = Math.max(now - firstTime, 1);
+  return Math.max(0, currentBytes - firstBytes) / elapsed;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /* --- Filtre protocole (piloté par le <select>, appliqué via les reducers
  * sigma : les arêtes d'un autre protocole sont masquées, leurs nœuds
  * estompés — aucune mutation des graphes, purement visuel). */
@@ -83,6 +103,9 @@ const SIGMA_BASE_SETTINGS = {
   labelColor: { color: "#aeb6c4" },
   labelSize: 11,
   labelRenderedSizeThreshold: 5,
+  edgeLabelColor: { color: "#aeb6c4" },
+  edgeLabelSize: 10,
+  renderEdgeLabels: false, /* activé par le bouton « Rates » */
   defaultNodeColor: OTHER_COLOR,
   defaultEdgeColor: "#333a48",
   minCameraRatio: 0.05,
@@ -246,7 +269,7 @@ class GraphView {
     return { x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius };
   }
 
-  upsertNode(id, label, bytes, packets, proto) {
+  upsertNode(id, label, bytes, packets, proto, bytesIn = 0, bytesOut = 0) {
     registerProto(proto);
     const attrs = {
       label,
@@ -255,6 +278,8 @@ class GraphView {
       bytes,
       packets,
       proto,
+      bytesIn,
+      bytesOut,
     };
     /* sigma v3 exige x/y AU MOMENT de l'ajout : la position fait partie des
      * attributs du merge. En mode force, jamais écrasée ensuite (FA2 la fait
@@ -264,6 +289,10 @@ class GraphView {
       const pos = this.mode === "circle" ? { x: 0, y: 0 } : this.spawnPosition();
       attrs.x = pos.x;
       attrs.y = pos.y;
+      /* Baseline des débits moyens « depuis l'affichage » (survol). */
+      attrs.firstIn = bytesIn;
+      attrs.firstOut = bytesOut;
+      attrs.firstTime = performance.now() / 1000;
     }
     this.graph.mergeNode(id, attrs);
     if (isNew) this.relayout();
@@ -285,8 +314,12 @@ class GraphView {
     let rate = 0;
     let prevBytes = bytes;
     let prevTime = now;
+    let firstBytes = bytes;
+    let firstTime = now;
     if (this.graph.hasEdge(id)) {
       const prev = this.graph.getEdgeAttributes(id);
+      firstBytes = prev.firstBytes ?? bytes;
+      firstTime = prev.firstTime ?? now;
       const dt = now - (prev.prevTime ?? now);
       if (dt >= 0.05) {
         const inst = Math.max(0, bytes - (prev.prevBytes ?? bytes)) / dt;
@@ -307,7 +340,23 @@ class GraphView {
       rate,
       prevBytes,
       prevTime,
+      firstBytes,
+      firstTime,
     });
+    if (ratesOn) this.updateEdgeLabel(id);
+  }
+
+  /* Label d'arête (bouton « Rates ») : débit moyen bidirectionnel depuis
+   * que le lien est affiché. */
+  updateEdgeLabel(edge) {
+    const attrs = this.graph.getEdgeAttributes(edge);
+    const now = performance.now() / 1000;
+    const avg = avgRate(attrs.bytes, attrs.firstBytes ?? attrs.bytes, attrs.firstTime ?? now, now);
+    this.graph.setEdgeAttribute(edge, "label", formatRate(avg));
+  }
+
+  updateAllEdgeLabels() {
+    this.graph.forEachEdge((edge) => this.updateEdgeLabel(edge));
   }
 
   removeNode(id) {
@@ -338,9 +387,11 @@ const views = {
   inter: new GraphView("graph-inter", "networks"),
 };
 
-/* Décroissance du débit des arêtes muettes (le serveur n'envoie d'upsert que
- * quand une conversation change) : sans nouvelles données depuis 2 s, le
- * débit affiché fond vers zéro avec la même constante de temps. */
+/* Ticker 1 Hz :
+ * - décroissance du débit lissé des arêtes muettes (le serveur n'envoie
+ *   d'upsert que quand une conversation change) ;
+ * - rafraîchissement des labels de débit moyen (bouton « Rates ») ;
+ * - rafraîchissement du tooltip de survol (les moyennes évoluent). */
 setInterval(() => {
   const now = performance.now() / 1000;
   for (const view of Object.values(views)) {
@@ -349,7 +400,9 @@ setInterval(() => {
         view.graph.setEdgeAttribute(edge, "rate", attrs.rate * RATE_DECAY);
       }
     });
+    if (ratesOn) view.updateAllEdgeLabels();
   }
+  refreshTooltip();
 }, 1000);
 
 /* --- Application des deltas. */
@@ -359,7 +412,15 @@ function applyDelta(delta) {
   if (!view) return;
   switch (delta.type) {
     case "upsert_node":
-      view.upsertNode(delta.id, delta.label, delta.bytes, delta.packets, delta.proto);
+      view.upsertNode(
+        delta.id,
+        delta.label,
+        delta.bytes,
+        delta.packets,
+        delta.proto,
+        delta.bytes_in,
+        delta.bytes_out,
+      );
       break;
     case "upsert_edge":
       view.upsertEdge(delta.id, delta.source, delta.target, delta.bytes, delta.packets, delta.proto);
@@ -427,6 +488,68 @@ for (const [key, view] of Object.entries(views)) {
     view.renderer.refresh({ skipIndexation: true });
   });
 }
+
+/* Bouton « Rates » : affiche sur chaque lien le débit moyen bidirectionnel
+ * (depuis que le lien est affiché), avec son unité. */
+const ratesEl = document.getElementById("rates");
+let ratesOn = false;
+
+ratesEl.addEventListener("click", () => {
+  ratesOn = !ratesOn;
+  ratesEl.classList.toggle("active", ratesOn);
+  for (const view of Object.values(views)) {
+    if (ratesOn) view.updateAllEdgeLabels();
+    view.renderer.setSetting("renderEdgeLabels", ratesOn);
+  }
+});
+
+/* --- Tooltip de survol des nœuds : identité + débits moyens in/out
+ * (moyennés depuis que l'hôte est affiché). */
+
+const tooltipEl = document.getElementById("tooltip");
+let hovered = null; /* { view, node } */
+
+function refreshTooltip() {
+  if (!hovered) return;
+  const { view, node } = hovered;
+  if (!view.graph.hasNode(node)) {
+    hovered = null;
+    tooltipEl.hidden = true;
+    return;
+  }
+  const attrs = view.graph.getNodeAttributes(node);
+  const now = performance.now() / 1000;
+  const outRate = avgRate(attrs.bytesOut || 0, attrs.firstOut || 0, attrs.firstTime ?? now, now);
+  const inRate = avgRate(attrs.bytesIn || 0, attrs.firstIn || 0, attrs.firstTime ?? now, now);
+  const lines = [`<strong>${escapeHtml(node)}</strong>`];
+  /* Etherman : MAC complète + version OUI ; Interman : IP + nom résolu. */
+  if (attrs.label && attrs.label !== node) {
+    lines.push(escapeHtml(attrs.label));
+  }
+  lines.push(`out: ${formatRate(outRate)}`, `in: ${formatRate(inRate)}`);
+  tooltipEl.innerHTML = lines.join("<br>");
+  tooltipEl.hidden = false;
+}
+
+for (const view of Object.values(views)) {
+  view.renderer.on("enterNode", ({ node }) => {
+    hovered = { view, node };
+    refreshTooltip();
+  });
+  view.renderer.on("leaveNode", () => {
+    hovered = null;
+    tooltipEl.hidden = true;
+  });
+}
+
+document.addEventListener("mousemove", (e) => {
+  if (tooltipEl.hidden) return;
+  const pad = 14;
+  const x = Math.min(e.clientX + pad, window.innerWidth - tooltipEl.offsetWidth - 8);
+  const y = Math.min(e.clientY + pad, window.innerHeight - tooltipEl.offsetHeight - 8);
+  tooltipEl.style.left = `${x}px`;
+  tooltipEl.style.top = `${y}px`;
+});
 
 /* Réglage du fade : slider → serveur ; le serveur renvoie {type:"config"} à
  * tous les clients (y compris l'émetteur), qui fait foi. */
