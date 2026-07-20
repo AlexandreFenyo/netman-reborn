@@ -1,18 +1,19 @@
 //! Netman Reborn — Etherman (L2) + Interman (L3), moniteur passif.
-//! Jalon 1 : capture promiscuous + compteur trames/s en console.
-
-mod capture;
+//! Jalon 2 : parsing + double agrégation, top talkers en console.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
 
-use capture::CaptureStats;
+use netman::capture::{self, CaptureStats};
+use netman::model::packet::{self, PacketMeta};
+use netman::model::tables::Tables;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,24 +38,11 @@ struct Cli {
     fade: u64,
 }
 
-/// Npcap installe wpcap.dll dans System32\Npcap, hors du chemin de recherche
-/// du loader. wpcap.dll est liée en delay-load (build.rs) : ce répertoire doit
-/// être ajouté AVANT le premier appel pcap. Voir RESEARCH.md.
-#[cfg(windows)]
-fn setup_npcap_dll_path() {
-    use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let dir = format!(r"{sysroot}\System32\Npcap");
-    let wide: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide` est une chaîne UTF-16 terminée par NUL, valide pendant l'appel.
-    unsafe {
-        SetDllDirectoryW(wide.as_ptr());
-    }
-}
+/// Capacité du channel capture→agrégateur. Plein ⇒ on jette (invariant 5).
+const CHANNEL_CAPACITY: usize = 65536;
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(windows)]
-    setup_npcap_dll_path();
+    netman::setup_npcap_dll_path();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -67,7 +55,7 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(
         port = cli.port,
         fade = cli.fade,
-        "netman starting (milestone 1)"
+        "netman starting (milestone 2)"
     );
 
     let stats = Arc::new(CaptureStats::default());
@@ -81,51 +69,84 @@ fn main() -> anyhow::Result<()> {
         .context("failed to install Ctrl-C handler")?;
     }
 
-    // Thread OS dédié à la boucle pcap bloquante (invariant 2).
-    let capture_thread = if let Some(file) = cli.pcap_file.clone() {
-        println!("Replaying {} (offline mode)...", file.display());
+    // Channel capture → agrégateur (découplage, invariant 2).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PacketMeta>(CHANNEL_CAPACITY);
+
+    // Thread OS dédié à la boucle pcap bloquante. Il ne fait que :
+    // capture → parse → try_send (jamais bloquant, invariant 5).
+    let capture_thread = {
         let stats = Arc::clone(&stats);
         let shutdown = Arc::clone(&shutdown);
-        std::thread::Builder::new()
-            .name("pcap-capture".into())
-            .spawn(move || capture::run_file(&file, stats, shutdown))
-            .context("failed to spawn capture thread")?
-    } else {
-        let devices = capture::list_devices().context("cannot enumerate capture interfaces")?;
-        let device = match &cli.iface {
-            Some(wanted) => capture::find_device(&devices, wanted)?,
-            None => prompt_device(&devices)?,
+        let on_packet = {
+            let stats = Arc::clone(&stats);
+            move |data: &[u8], wire_len: u32| match packet::parse_frame(data, wire_len) {
+                Some(meta) => {
+                    if let Err(TrySendError::Full(_)) = tx.try_send(meta) {
+                        stats.chan_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         };
-        println!(
-            "Capturing on: {} (promiscuous)",
-            capture::device_label(&device)
-        );
-        let stats = Arc::clone(&stats);
-        let shutdown = Arc::clone(&shutdown);
-        std::thread::Builder::new()
-            .name("pcap-capture".into())
-            .spawn(move || capture::run_live(device, stats, shutdown))
-            .context("failed to spawn capture thread")?
+
+        if let Some(file) = cli.pcap_file.clone() {
+            println!("Replaying {} (offline mode)...", file.display());
+            std::thread::Builder::new()
+                .name("pcap-capture".into())
+                .spawn(move || capture::run_file(&file, stats, shutdown, on_packet))
+                .context("failed to spawn capture thread")?
+        } else {
+            let devices = capture::list_devices().context("cannot enumerate capture interfaces")?;
+            let device = match &cli.iface {
+                Some(wanted) => capture::find_device(&devices, wanted)?,
+                None => prompt_device(&devices)?,
+            };
+            println!(
+                "Capturing on: {} (promiscuous)",
+                capture::device_label(&device)
+            );
+            std::thread::Builder::new()
+                .name("pcap-capture".into())
+                .spawn(move || capture::run_live(device, stats, shutdown, on_packet))
+                .context("failed to spawn capture thread")?
+        }
     };
 
-    // Affichage 1 Hz : trames/s, débit, drops kernel, totaux.
+    // Agrégateur : consomme les PacketMeta, maintient les deux tables,
+    // affiche stats + top talkers toutes les 2 s.
+    let mut tables = Tables::new();
+    let mut last_dump = Instant::now();
     let mut last_frames = 0u64;
     let mut last_bytes = 0u64;
-    while !shutdown.load(Ordering::Relaxed) && !capture_thread.is_finished() {
-        std::thread::sleep(Duration::from_secs(1));
-        let frames = stats.frames.load(Ordering::Relaxed);
-        let bytes = stats.bytes.load(Ordering::Relaxed);
-        let drops = stats.kernel_drops.load(Ordering::Relaxed);
-        println!(
-            "{:>8} frames/s | {:>10}/s | drops {:>6} | total {} frames, {}",
-            frames - last_frames,
-            human_bytes(bytes - last_bytes),
-            drops,
-            frames,
-            human_bytes(bytes),
-        );
-        last_frames = frames;
-        last_bytes = bytes;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(meta) => tables.ingest(&meta, Instant::now()),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break, // thread capture terminé
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        if last_dump.elapsed() >= Duration::from_secs(2) {
+            last_dump = Instant::now();
+            let frames = stats.frames.load(Ordering::Relaxed);
+            let bytes = stats.bytes.load(Ordering::Relaxed);
+            dump_top_talkers(
+                &tables,
+                (frames - last_frames) / 2,
+                (bytes - last_bytes) / 2,
+                &stats,
+            );
+            last_frames = frames;
+            last_bytes = bytes;
+        }
+    }
+
+    // Draine ce qui reste (fin de fichier pcap notamment) avant le bilan.
+    while let Ok(meta) = rx.try_recv() {
+        tables.ingest(&meta, Instant::now());
     }
 
     shutdown.store(true, Ordering::Relaxed);
@@ -133,12 +154,45 @@ fn main() -> anyhow::Result<()> {
         Ok(result) => result.context("capture failed")?,
         Err(_) => anyhow::bail!("capture thread panicked"),
     }
-    println!(
-        "Done: {} frames, {} captured.",
-        stats.frames.load(Ordering::Relaxed),
-        human_bytes(stats.bytes.load(Ordering::Relaxed)),
-    );
+
+    println!("\n=== Final summary ===");
+    dump_top_talkers(&tables, 0, 0, &stats);
     Ok(())
+}
+
+fn dump_top_talkers(tables: &Tables, fps: u64, bps: u64, stats: &CaptureStats) {
+    println!(
+        "\n-- {} frames/s | {}/s | L2 convs: {} | L3 convs: {} | kernel drops {} | chan drops {} | unparsed {}",
+        fps,
+        human_bytes(bps),
+        tables.l2.len(),
+        tables.l3.len(),
+        stats.kernel_drops.load(Ordering::Relaxed),
+        stats.chan_drops.load(Ordering::Relaxed),
+        stats.parse_errors.load(Ordering::Relaxed),
+    );
+    println!("   Top talkers — Etherman (L2/MAC):");
+    for (key, conv) in tables.top_l2(5) {
+        println!(
+            "     {} <-> {}  {:<10} {:>10}  {:>7} pkts",
+            key.0,
+            key.1,
+            conv.dominant_proto().to_string(),
+            human_bytes(conv.bytes),
+            conv.packets,
+        );
+    }
+    println!("   Top talkers — Interman (L3/IP):");
+    for (key, conv) in tables.top_l3(5) {
+        println!(
+            "     {} <-> {}  {:<10} {:>10}  {:>7} pkts",
+            key.0,
+            key.1,
+            conv.dominant_proto().to_string(),
+            human_bytes(conv.bytes),
+            conv.packets,
+        );
+    }
 }
 
 /// Sélection interactive : liste numérotée, choix au clavier.

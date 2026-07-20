@@ -28,6 +28,11 @@ pub struct CaptureStats {
     pub bytes: AtomicU64,
     /// Paquets perdus par le kernel/Npcap (compteur cumulatif `ps_drop`).
     pub kernel_drops: AtomicU64,
+    /// Trames non décodables (pas Ethernet II, tronquées…).
+    pub parse_errors: AtomicU64,
+    /// Métadonnées jetées car le channel vers l'agrégateur était plein
+    /// (invariant 5 : on jette plutôt que de bloquer la capture).
+    pub chan_drops: AtomicU64,
 }
 
 pub fn list_devices() -> Result<Vec<Device>, CaptureError> {
@@ -87,10 +92,13 @@ fn open_live(device: Device) -> Result<Capture<Active>, CaptureError> {
 
 /// Boucle de capture live. À exécuter sur un thread OS dédié.
 /// S'arrête quand `shutdown` passe à true (testé à chaque timeout pcap).
+/// `on_packet(data, wire_len)` est appelé pour chaque trame — il doit rester
+/// non bloquant (parse + try_send, rien d'autre).
 pub fn run_live(
     device: Device,
     stats: Arc<CaptureStats>,
     shutdown: Arc<AtomicBool>,
+    mut on_packet: impl FnMut(&[u8], u32),
 ) -> Result<(), CaptureError> {
     let mut cap = open_live(device)?;
     let mut last_kstats = Instant::now();
@@ -105,6 +113,7 @@ pub fn run_live(
                 stats
                     .bytes
                     .fetch_add(u64::from(packet.header.len), Ordering::Relaxed);
+                on_packet(packet.data, packet.header.len);
                 // Rafraîchit les stats kernel ~1×/s même sous charge continue.
                 if last_kstats.elapsed() >= Duration::from_secs(1) {
                     last_kstats = Instant::now();
@@ -133,6 +142,7 @@ pub fn run_file(
     path: &Path,
     stats: Arc<CaptureStats>,
     shutdown: Arc<AtomicBool>,
+    mut on_packet: impl FnMut(&[u8], u32),
 ) -> Result<(), CaptureError> {
     let mut cap = Capture::from_file(path)?;
     loop {
@@ -145,6 +155,7 @@ pub fn run_file(
                 stats
                     .bytes
                     .fetch_add(u64::from(packet.header.len), Ordering::Relaxed);
+                on_packet(packet.data, packet.header.len);
             }
             Err(pcap::Error::NoMorePackets) => return Ok(()),
             Err(e) => return Err(e.into()),
