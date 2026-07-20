@@ -83,9 +83,10 @@ et le serveur.
   - *Pause / Resume* — gèle les deux vues (la capture continue ; la reprise
     resynchronise sur l'état serveur) ;
   - *Reset* — reconstruit les vues depuis l'état serveur courant ;
-  - *Rates* — affiche sur chaque lien le débit moyen bidirectionnel (unité
-    adaptée : bit/s, kbit/s, Mbit/s, Gbit/s), moyenné depuis que le lien est
-    affiché ;
+  - *Rates* (actif par défaut) — affiche sur chaque lien le débit moyen
+    bidirectionnel (unité adaptée : bit/s, kbit/s, Mbit/s, Gbit/s), calculé
+    entre le premier et le dernier paquet observés depuis que le lien est
+    affiché en continu (aucune mémoire après une disparition par fade) ;
   - *Protocol* — met en avant un protocole (les autres arêtes sont masquées,
     les nœuds estompés) ;
   - *Fade* — délai au bout duquel nœuds et arêtes silencieux disparaissent
@@ -93,7 +94,8 @@ et le serveur.
 - **Survol d'un nœud** : Etherman affiche la MAC complète et sa forme
   « Fabricant xx:yy:zz » ; Interman affiche l'IP et le nom résolu s'il est
   connu ; les deux ajoutent `out:` (débit sortant) et `in:` (débit entrant),
-  moyennés depuis que l'hôte est affiché.
+  calculés entre le premier et le dernier paquet observés depuis que l'hôte
+  est affiché en continu.
 - Molette = zoom, glisser = déplacement.
 
 ## Architecture (résumé)

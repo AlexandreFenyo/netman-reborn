@@ -82,11 +82,14 @@ function formatRate(bytesPerSec) {
   return `${(bps / 1e9).toFixed(2)} Gbit/s`;
 }
 
-/* Débit moyen depuis que l'élément est affiché (baseline posée à sa
- * création côté client ; plancher 1 s pour éviter la division par ~0). */
-function avgRate(currentBytes, firstBytes, firstTime, now) {
-  const elapsed = Math.max(now - firstTime, 1);
-  return Math.max(0, currentBytes - firstBytes) / elapsed;
+/* Débit moyen entre le PREMIER et le DERNIER paquet observés depuis que
+ * l'élément est affiché en continu : la fenêtre s'arrête au dernier paquet
+ * (pas de dilution quand le trafic cesse). Aucune mémoire pour les éléments
+ * disparus par fade : la base repart de zéro à leur réapparition (leurs
+ * attributs client ET leurs compteurs serveur sont recréés). */
+function avgRate(currentBytes, firstBytes, firstTime, lastTime) {
+  const span = Math.max(lastTime - firstTime, 0.5);
+  return Math.max(0, currentBytes - firstBytes) / span;
 }
 
 function escapeHtml(s) {
@@ -105,7 +108,7 @@ const SIGMA_BASE_SETTINGS = {
   labelRenderedSizeThreshold: 5,
   edgeLabelColor: { color: "#aeb6c4" },
   edgeLabelSize: 10,
-  renderEdgeLabels: false, /* activé par le bouton « Rates » */
+  renderEdgeLabels: true, /* « Rates » est actif par défaut */
   defaultNodeColor: OTHER_COLOR,
   defaultEdgeColor: "#333a48",
   minCameraRatio: 0.05,
@@ -285,14 +288,20 @@ class GraphView {
      * attributs du merge. En mode force, jamais écrasée ensuite (FA2 la fait
      * vivre) ; en mode cercle, le layout redistribue tout de suite. */
     const isNew = !this.graph.hasNode(id);
+    const now = performance.now() / 1000;
     if (isNew) {
       const pos = this.mode === "circle" ? { x: 0, y: 0 } : this.spawnPosition();
       attrs.x = pos.x;
       attrs.y = pos.y;
-      /* Baseline des débits moyens « depuis l'affichage » (survol). */
+      /* Fenêtre des débits moyens (survol) : [premier, dernier] paquet. */
       attrs.firstIn = bytesIn;
       attrs.firstOut = bytesOut;
-      attrs.firstTime = performance.now() / 1000;
+      attrs.firstTime = now;
+      attrs.lastTime = now;
+    } else if (bytes !== this.graph.getNodeAttribute(id, "bytes")) {
+      /* N'avance la fin de fenêtre que si des paquets sont arrivés (un
+       * upsert peut ne porter qu'un changement de label, ex. PTR résolu). */
+      attrs.lastTime = now;
     }
     this.graph.mergeNode(id, attrs);
     if (isNew) this.relayout();
@@ -346,12 +355,19 @@ class GraphView {
     if (ratesOn) this.updateEdgeLabel(id);
   }
 
-  /* Label d'arête (bouton « Rates ») : débit moyen bidirectionnel depuis
-   * que le lien est affiché. */
+  /* Label d'arête (bouton « Rates ») : débit moyen bidirectionnel entre le
+   * premier et le dernier paquet observés depuis l'affichage du lien
+   * (prevTime = dernière mise à jour réelle, les arêtes n'étant re-diffusées
+   * que quand du trafic passe). */
   updateEdgeLabel(edge) {
     const attrs = this.graph.getEdgeAttributes(edge);
     const now = performance.now() / 1000;
-    const avg = avgRate(attrs.bytes, attrs.firstBytes ?? attrs.bytes, attrs.firstTime ?? now, now);
+    const avg = avgRate(
+      attrs.bytes,
+      attrs.firstBytes ?? attrs.bytes,
+      attrs.firstTime ?? now,
+      attrs.prevTime ?? now,
+    );
     this.graph.setEdgeAttribute(edge, "label", formatRate(avg));
   }
 
@@ -492,7 +508,7 @@ for (const [key, view] of Object.entries(views)) {
 /* Bouton « Rates » : affiche sur chaque lien le débit moyen bidirectionnel
  * (depuis que le lien est affiché), avec son unité. */
 const ratesEl = document.getElementById("rates");
-let ratesOn = false;
+let ratesOn = true;
 
 ratesEl.addEventListener("click", () => {
   ratesOn = !ratesOn;
@@ -519,8 +535,10 @@ function refreshTooltip() {
   }
   const attrs = view.graph.getNodeAttributes(node);
   const now = performance.now() / 1000;
-  const outRate = avgRate(attrs.bytesOut || 0, attrs.firstOut || 0, attrs.firstTime ?? now, now);
-  const inRate = avgRate(attrs.bytesIn || 0, attrs.firstIn || 0, attrs.firstTime ?? now, now);
+  const first = attrs.firstTime ?? now;
+  const last = attrs.lastTime ?? now;
+  const outRate = avgRate(attrs.bytesOut || 0, attrs.firstOut || 0, first, last);
+  const inRate = avgRate(attrs.bytesIn || 0, attrs.firstIn || 0, first, last);
   const lines = [`<strong>${escapeHtml(node)}</strong>`];
   /* Etherman : MAC complète + version OUI ; Interman : IP + nom résolu. */
   if (attrs.label && attrs.label !== node) {
