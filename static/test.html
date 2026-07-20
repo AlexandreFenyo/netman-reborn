@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Netman pipeline self-test</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="topbar">
+    <span id="title">Pipeline <em>self-test</em></span>
+    <span id="debug"></span>
+    <span id="status" class="disconnected">offline test</span>
+  </header>
+  <main id="panels">
+    <section class="panel">
+      <h2>Etherman — Layer 2 (MAC)</h2>
+      <div id="graph-ether" class="graph"></div>
+    </section>
+    <section class="panel">
+      <h2>Interman — Layer 3 (IP)</h2>
+      <div id="graph-inter" class="graph"></div>
+    </section>
+  </main>
+  <script src="vendor/graphology.umd.min.js"></script>
+  <script src="vendor/graphology-library.min.js"></script>
+  <script src="vendor/sigma.min.js"></script>
+  <script>
+    /* Neutralise la connexion WS d'app.js : ce test applique des deltas figés. */
+    window.WebSocket = class { constructor() { setTimeout(() => this.onclose && this.onclose(), 0); } close() {} };
+  </script>
+  <script src="app.js"></script>
+  <script>
+    const SAMPLE = [
+      {type:"upsert_node",view:"ether",id:"aa:aa:aa:aa:aa:01",label:"aa:aa:aa:aa:aa:01",bytes:150000,packets:120,proto:"IPv4"},
+      {type:"upsert_node",view:"ether",id:"aa:aa:aa:aa:aa:02",label:"aa:aa:aa:aa:aa:02",bytes:80000,packets:60,proto:"IPv6"},
+      {type:"upsert_node",view:"ether",id:"ff:ff:ff:ff:ff:ff",label:"ff:ff:ff:ff:ff:ff",bytes:1200,packets:20,proto:"ARP"},
+      {type:"upsert_edge",view:"ether",id:"e1",source:"aa:aa:aa:aa:aa:01",target:"aa:aa:aa:aa:aa:02",bytes:120000,packets:100,proto:"IPv4"},
+      {type:"upsert_edge",view:"ether",id:"e2",source:"aa:aa:aa:aa:aa:01",target:"ff:ff:ff:ff:ff:ff",bytes:1200,packets:20,proto:"ARP"},
+      {type:"upsert_node",view:"inter",id:"192.168.0.21",label:"192.168.0.21",bytes:90000,packets:80,proto:"HTTPS"},
+      {type:"upsert_node",view:"inter",id:"93.184.216.34",label:"93.184.216.34",bytes:90000,packets:80,proto:"HTTPS"},
+      {type:"upsert_edge",view:"inter",id:"i1",source:"192.168.0.21",target:"93.184.216.34",bytes:90000,packets:80,proto:"HTTPS"},
+      {type:"remove_edge",view:"ether",id:"e2"},
+      {type:"remove_node",view:"ether",id:"ff:ff:ff:ff:ff:ff"},
+    ];
+    const out = [];
+    for (let n = 0; n < SAMPLE.length; n++) {
+      try {
+        applyDelta(SAMPLE[n]);
+      } catch (err) {
+        out.push(`FAIL[${n} ${SAMPLE[n].type}]: ${err.message}`);
+      }
+    }
+    const e = views.ether.graph, i = views.inter.graph;
+    out.push(`ether=${e.order}n/${e.size}e inter=${i.order}n/${i.size}e`);
+    out.push(`fa2=${views.ether.layout ? "on" : "off"}/${views.inter.layout ? "on" : "off"}`);
+    out.push(`canvases=${document.querySelectorAll("#graph-ether canvas").length}`);
+    const el = document.createElement("div");
+    el.id = "testout";
+    el.textContent = out.join(" § ");
+    document.body.appendChild(el);
+  </script>
+</body>
+</html>

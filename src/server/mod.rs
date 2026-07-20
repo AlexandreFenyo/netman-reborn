@@ -6,6 +6,7 @@
 //! on saute les deltas manqués, les upserts suivants réparent (valeurs
 //! absolues). La capture n'est jamais ralentie (invariant 5).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -18,7 +19,11 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use crate::model::tables::Tables;
-use crate::wsproto::Delta;
+use crate::wsproto::{ClientCommand, Delta, ServerInfo};
+
+/// Bornes du délai de fade réglable depuis l'IHM.
+pub const FADE_MIN_SECS: u64 = 5;
+pub const FADE_MAX_SECS: u64 = 3600;
 
 /// État partagé du serveur.
 #[derive(Clone)]
@@ -27,6 +32,8 @@ pub struct AppState {
     /// snapshot de connexion (verrou bref, jamais tenu à travers un await).
     pub tables: Arc<Mutex<Tables>>,
     pub deltas_tx: broadcast::Sender<Utf8Bytes>,
+    /// Délai de fade courant (secondes), réglable par les clients.
+    pub fade_secs: Arc<AtomicU64>,
 }
 
 /// Construit le routeur : `/ws` + fichiers statiques (frontend).
@@ -52,6 +59,33 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     ws.on_upgrade(move |socket| client_loop(socket, state))
 }
 
+/// Encode le message de configuration courant.
+fn encode_config(fade_secs: u64) -> Option<Utf8Bytes> {
+    match serde_json::to_string(&ServerInfo::Config { fade_secs }) {
+        Ok(json) => Some(Utf8Bytes::from(json)),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize config");
+            None
+        }
+    }
+}
+
+/// Traite un message texte reçu d'un client.
+fn handle_client_command(text: &str, state: &AppState) {
+    match serde_json::from_str::<ClientCommand>(text) {
+        Ok(ClientCommand::SetFade { seconds }) => {
+            let clamped = seconds.clamp(FADE_MIN_SECS, FADE_MAX_SECS);
+            state.fade_secs.store(clamped, Ordering::Relaxed);
+            tracing::info!(fade_secs = clamped, "fade timeout updated by client");
+            // Propage la nouvelle config à tous les clients connectés.
+            if let Some(msg) = encode_config(clamped) {
+                let _ = state.deltas_tx.send(msg);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, text, "unrecognized client message"),
+    }
+}
+
 async fn client_loop(socket: WebSocket, state: AppState) {
     // S'abonner AVANT de construire le snapshot : on ne peut rien rater,
     // au pire on reçoit des upserts en double (valeurs absolues → sans effet).
@@ -70,6 +104,12 @@ async fn client_loop(socket: WebSocket, state: AppState) {
     };
 
     let (mut sink, mut stream) = socket.split();
+    // Configuration courante d'abord (le slider s'initialise), puis snapshot.
+    if let Some(msg) = encode_config(state.fade_secs.load(Ordering::Relaxed)) {
+        if sink.send(Message::Text(msg)).await.is_err() {
+            return;
+        }
+    }
     for msg in snapshot {
         if sink.send(Message::Text(msg)).await.is_err() {
             return;
@@ -87,15 +127,15 @@ async fn client_loop(socket: WebSocket, state: AppState) {
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     // Client trop lent : deltas sautés, les upserts suivants
-                    // réparent. Les remove_* manqués seront re-traités au
-                    // jalon fade (valeurs absolues + capacité généreuse).
+                    // réparent (valeurs absolues + capacité généreuse).
                     tracing::warn!(skipped, "slow websocket client lagged");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(text))) => handle_client_command(text.as_str(), &state),
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {} // rien d'attendu du client pour l'instant
+                Some(Ok(_)) => {}
             },
         }
     }

@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,15 +138,24 @@ async fn async_main(
 ) -> anyhow::Result<()> {
     let tables = Arc::new(Mutex::new(Tables::new()));
     let (deltas_tx, _) = broadcast::channel::<Utf8Bytes>(BROADCAST_CAPACITY);
+    let fade_secs = Arc::new(AtomicU64::new(
+        cli.fade
+            .clamp(netman::server::FADE_MIN_SECS, netman::server::FADE_MAX_SECS),
+    ));
 
     tokio::spawn(aggregate_loop(
         meta_rx,
         Arc::clone(&tables),
         deltas_tx.clone(),
         Arc::clone(&stats),
+        Arc::clone(&fade_secs),
     ));
 
-    let state = AppState { tables, deltas_tx };
+    let state = AppState {
+        tables,
+        deltas_tx,
+        fade_secs,
+    };
     let app = server::router(state, &cli.static_dir);
     let addr = format!("127.0.0.1:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -171,6 +180,7 @@ async fn aggregate_loop(
     tables: Arc<Mutex<Tables>>,
     deltas_tx: broadcast::Sender<Utf8Bytes>,
     stats: Arc<CaptureStats>,
+    fade_secs: Arc<AtomicU64>,
 ) {
     let mut buf: Vec<PacketMeta> = Vec::with_capacity(4096);
     let mut tick = tokio::time::interval(TICK);
@@ -196,7 +206,11 @@ async fn aggregate_loop(
             _ = tick.tick() => {
                 let deltas = {
                     let Ok(mut tables) = tables.lock() else { return };
-                    tables.drain_deltas()
+                    let mut deltas = tables.drain_deltas();
+                    // Vieillissement : suppressions explicites (invariant 7).
+                    let max_age = Duration::from_secs(fade_secs.load(Ordering::Relaxed));
+                    deltas.extend(tables.fade_sweep(Instant::now(), max_age));
+                    deltas
                 };
                 for delta in &deltas {
                     if let Some(msg) = server::encode_delta(delta) {

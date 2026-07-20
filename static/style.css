@@ -1,0 +1,87 @@
+/* Netman Reborn — deux panneaux côte à côte sur fond sombre (hommage X11). */
+
+:root {
+  --bg: #0b0e14;
+  --panel-bg: #10141d;
+  --panel-border: #232a38;
+  --fg: #d5dbe5;
+  --muted: #7a8496;
+  --accent: #4c9be8;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+body { display: flex; flex-direction: column; }
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.4rem 0.9rem;
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+}
+
+#title { font-size: 1.05rem; font-weight: 600; letter-spacing: 0.03em; }
+#title em { color: var(--accent); font-style: normal; }
+
+#fade-control {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+#fade-control input[type="range"] {
+  width: 140px;
+  accent-color: var(--accent);
+}
+
+#fade-value {
+  min-width: 3.2em;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+#debug { margin-left: auto; font-size: 0.75rem; color: var(--muted); }
+#status { font-size: 0.8rem; }
+#status.connected { color: #2ecc71; }
+#status.disconnected { color: #e74c3c; }
+
+#panels {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--panel-border);
+  min-height: 0;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  min-width: 0;
+  min-height: 0;
+}
+
+.panel h2 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 0.45rem 0.9rem;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.graph { flex: 1; min-height: 0; }

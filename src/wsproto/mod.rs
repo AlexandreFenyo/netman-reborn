@@ -48,6 +48,22 @@ pub enum Delta {
     },
 }
 
+/// Message de contrôle client → serveur.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientCommand {
+    /// Règle le délai de fade (nœuds/arêtes non revus depuis N s → retirés).
+    SetFade { seconds: u64 },
+}
+
+/// Message d'information serveur → client, hors mutations de graphe.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerInfo {
+    /// Configuration courante (envoyée à la connexion et à chaque changement).
+    Config { fade_secs: u64 },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +106,17 @@ mod tests {
             serde_json::to_string(&rm).unwrap(),
             r#"{"type":"remove_edge","view":"inter","id":"10.0.0.1|10.0.0.2"}"#
         );
+    }
+
+    #[test]
+    fn control_messages_shape() {
+        assert_eq!(
+            serde_json::to_string(&ServerInfo::Config { fade_secs: 60 }).unwrap(),
+            r#"{"type":"config","fade_secs":60}"#
+        );
+        let cmd: ClientCommand =
+            serde_json::from_str(r#"{"type":"set_fade","seconds":120}"#).unwrap();
+        assert_eq!(cmd, ClientCommand::SetFade { seconds: 120 });
     }
 
     #[test]

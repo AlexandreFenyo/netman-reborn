@@ -2,10 +2,34 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Netman Reborn</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Netman Reborn — Etherman + Interman</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>Netman Reborn</h1>
-  <p>Frontend arrives in milestone 4. WebSocket endpoint: <code>/ws</code>.</p>
+  <header id="topbar">
+    <span id="title">Netman <em>Reborn</em></span>
+    <label id="fade-control" title="Nodes and their links disappear after this many seconds without traffic">
+      Fade
+      <input type="range" id="fade" min="5" max="600" step="5" value="60">
+      <span id="fade-value">60&nbsp;s</span>
+    </label>
+    <span id="debug"></span>
+    <span id="status" class="disconnected">connecting…</span>
+  </header>
+  <main id="panels">
+    <section class="panel">
+      <h2>Etherman — Layer 2 (MAC)</h2>
+      <div id="graph-ether" class="graph"></div>
+    </section>
+    <section class="panel">
+      <h2>Interman — Layer 3 (IP)</h2>
+      <div id="graph-inter" class="graph"></div>
+    </section>
+  </main>
+  <script src="vendor/graphology.umd.min.js"></script>
+  <script src="vendor/graphology-library.min.js"></script>
+  <script src="vendor/sigma.min.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

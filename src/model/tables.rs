@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::packet::{Mac, PacketMeta, Proto};
 use crate::wsproto::{Delta, View};
@@ -171,6 +171,74 @@ impl Tables {
                     stats,
                 ));
             }
+        }
+        out
+    }
+
+    /// Vieillissement (invariant 7) : retire les conversations et nœuds non
+    /// revus depuis `max_age` et produit les deltas `remove_*` explicites.
+    /// Arêtes d'abord, puis nœuds (un nœud périmé implique que toutes ses
+    /// arêtes le sont : son last_seen est rafraîchi par chacune d'elles).
+    pub fn fade_sweep(&mut self, now: Instant, max_age: Duration) -> Vec<Delta> {
+        let mut out = Vec::new();
+        let stale = |stats: &ConvStats| now.duration_since(stats.last_seen) > max_age;
+
+        let stale_l2: Vec<L2Key> = self
+            .l2
+            .iter()
+            .filter(|(_, s)| stale(s))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale_l2 {
+            self.l2.remove(&key);
+            self.dirty_l2.remove(&key);
+            out.push(Delta::RemoveEdge {
+                view: View::Ether,
+                id: edge_id(&key.0.to_string(), &key.1.to_string()),
+            });
+        }
+        let stale_l3: Vec<L3Key> = self
+            .l3
+            .iter()
+            .filter(|(_, s)| stale(s))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale_l3 {
+            self.l3.remove(&key);
+            self.dirty_l3.remove(&key);
+            out.push(Delta::RemoveEdge {
+                view: View::Inter,
+                id: edge_id(&key.0.to_string(), &key.1.to_string()),
+            });
+        }
+
+        let stale_macs: Vec<Mac> = self
+            .l2_nodes
+            .iter()
+            .filter(|(_, s)| stale(s))
+            .map(|(k, _)| *k)
+            .collect();
+        for mac in stale_macs {
+            self.l2_nodes.remove(&mac);
+            self.dirty_l2_nodes.remove(&mac);
+            out.push(Delta::RemoveNode {
+                view: View::Ether,
+                id: mac.to_string(),
+            });
+        }
+        let stale_ips: Vec<IpAddr> = self
+            .l3_nodes
+            .iter()
+            .filter(|(_, s)| stale(s))
+            .map(|(k, _)| *k)
+            .collect();
+        for ip in stale_ips {
+            self.l3_nodes.remove(&ip);
+            self.dirty_l3_nodes.remove(&ip);
+            out.push(Delta::RemoveNode {
+                view: View::Inter,
+                id: ip.to_string(),
+            });
         }
         out
     }
@@ -363,6 +431,48 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert_eq!(*top[0].0, L2Key::new(MAC_A, mac_c), "plus gros en premier");
         assert_eq!(top[0].1.bytes, 500);
+    }
+
+    #[test]
+    fn fade_sweep_removes_stale_and_emits_deltas() {
+        use crate::wsproto::Delta;
+        let mut tables = Tables::new();
+        let t0 = Instant::now();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                100,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            t0,
+        );
+        tables.drain_deltas();
+
+        // Avant expiration : rien ne bouge.
+        assert!(tables
+            .fade_sweep(t0 + Duration::from_secs(30), Duration::from_secs(60))
+            .is_empty());
+
+        // Après expiration : tout est retiré, avec les remove_* explicites,
+        // arêtes avant nœuds.
+        let deltas = tables.fade_sweep(t0 + Duration::from_secs(61), Duration::from_secs(60));
+        assert_eq!(deltas.len(), 6, "2 arêtes + 4 nœuds");
+        assert!(matches!(deltas[0], Delta::RemoveEdge { .. }));
+        assert!(matches!(deltas[1], Delta::RemoveEdge { .. }));
+        assert!(deltas[2..]
+            .iter()
+            .all(|d| matches!(d, Delta::RemoveNode { .. })));
+        assert!(tables.l2.is_empty() && tables.l3.is_empty());
+        assert!(tables.l2_nodes.is_empty() && tables.l3_nodes.is_empty());
+
+        // Re-trafic → tout est recréé proprement (upserts).
+        tables.ingest(&meta(MAC_A, MAC_B, 10, Proto::Named("ARP"), None), t0);
+        assert_eq!(tables.drain_deltas().len(), 3);
     }
 
     #[test]
