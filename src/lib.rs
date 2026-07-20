@@ -3,6 +3,7 @@
 
 pub mod capture;
 pub mod model;
+pub mod resolve;
 pub mod server;
 pub mod wsproto;
 

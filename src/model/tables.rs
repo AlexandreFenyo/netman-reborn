@@ -89,6 +89,8 @@ pub struct Tables {
     pub l3: HashMap<L3Key, ConvStats>,
     pub l2_nodes: HashMap<Mac, ConvStats>,
     pub l3_nodes: HashMap<IpAddr, ConvStats>,
+    /// Noms résolus (reverse DNS) : cache de session, survit au fade.
+    l3_labels: HashMap<IpAddr, String>,
     dirty_l2: HashSet<L2Key>,
     dirty_l3: HashSet<L3Key>,
     dirty_l2_nodes: HashSet<Mac>,
@@ -142,14 +144,20 @@ impl Tables {
                 + self.dirty_l2.len()
                 + self.dirty_l3.len(),
         );
-        for mac in self.dirty_l2_nodes.drain() {
+        for mac in std::mem::take(&mut self.dirty_l2_nodes) {
             if let Some(stats) = self.l2_nodes.get(&mac) {
-                out.push(node_delta(View::Ether, mac.to_string(), stats));
+                let id = mac.to_string();
+                out.push(node_delta(View::Ether, id.clone(), id, stats));
             }
         }
-        for ip in self.dirty_l3_nodes.drain() {
+        for ip in std::mem::take(&mut self.dirty_l3_nodes) {
             if let Some(stats) = self.l3_nodes.get(&ip) {
-                out.push(node_delta(View::Inter, ip.to_string(), stats));
+                out.push(node_delta(
+                    View::Inter,
+                    ip.to_string(),
+                    self.l3_label(&ip),
+                    stats,
+                ));
             }
         }
         for key in self.dirty_l2.drain() {
@@ -173,6 +181,30 @@ impl Tables {
             }
         }
         out
+    }
+
+    /// Enregistre un nom résolu ; si le nœud est affiché, il repart en upsert
+    /// au prochain tick avec son nouveau label. Le nom est conservé même si
+    /// le nœud a disparu entre-temps (il resservira s'il réapparaît).
+    pub fn set_l3_label(&mut self, ip: IpAddr, label: String) {
+        if self.l3_nodes.contains_key(&ip) {
+            self.dirty_l3_nodes.insert(ip);
+        }
+        self.l3_labels.insert(ip, label);
+    }
+
+    /// Label affiché d'un nœud L3 : nom résolu, sinon l'adresse.
+    fn l3_label(&self, ip: &IpAddr) -> String {
+        self.l3_labels
+            .get(ip)
+            .cloned()
+            .unwrap_or_else(|| ip.to_string())
+    }
+
+    /// IPs des nœuds L3 modifiés depuis le dernier tick (pour déclencher les
+    /// résolutions PTR côté agrégateur, avant `drain_deltas`).
+    pub fn dirty_l3_node_ips(&self) -> Vec<IpAddr> {
+        self.dirty_l3_nodes.iter().copied().collect()
     }
 
     /// Vieillissement (invariant 7) : retire les conversations et nœuds non
@@ -249,10 +281,16 @@ impl Tables {
             self.l2_nodes.len() + self.l3_nodes.len() + self.l2.len() + self.l3.len(),
         );
         for (mac, stats) in &self.l2_nodes {
-            out.push(node_delta(View::Ether, mac.to_string(), stats));
+            let id = mac.to_string();
+            out.push(node_delta(View::Ether, id.clone(), id, stats));
         }
         for (ip, stats) in &self.l3_nodes {
-            out.push(node_delta(View::Inter, ip.to_string(), stats));
+            out.push(node_delta(
+                View::Inter,
+                ip.to_string(),
+                self.l3_label(ip),
+                stats,
+            ));
         }
         for (key, stats) in &self.l2 {
             out.push(edge_delta(
@@ -295,11 +333,11 @@ fn edge_id(a: &str, b: &str) -> String {
     format!("{a}|{b}")
 }
 
-fn node_delta(view: View, id: String, stats: &ConvStats) -> Delta {
+fn node_delta(view: View, id: String, label: String, stats: &ConvStats) -> Delta {
     Delta::UpsertNode {
         view,
-        label: id.clone(),
         id,
+        label,
         bytes: stats.bytes,
         packets: stats.packets,
         proto: stats.dominant_proto().to_string(),
@@ -431,6 +469,61 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert_eq!(*top[0].0, L2Key::new(MAC_A, mac_c), "plus gros en premier");
         assert_eq!(top[0].1.bytes, 500);
+    }
+
+    #[test]
+    fn resolved_label_replaces_ip_and_survives_fade() {
+        use crate::wsproto::Delta;
+        let mut tables = Tables::new();
+        let t0 = Instant::now();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                100,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            t0,
+        );
+        // Avant résolution : label = IP.
+        let label_of = |deltas: &[Delta], ip: &str| -> Option<String> {
+            deltas.iter().find_map(|d| match d {
+                Delta::UpsertNode { id, label, .. } if id == ip => Some(label.clone()),
+                _ => None,
+            })
+        };
+        let deltas = tables.drain_deltas();
+        assert_eq!(label_of(&deltas, "10.0.0.1").unwrap(), "10.0.0.1");
+
+        // Résolution → le nœud repart en upsert avec le nom.
+        tables.set_l3_label(ip_a, "nas.local".into());
+        let deltas = tables.drain_deltas();
+        assert_eq!(deltas.len(), 1, "seul le nœud résolu est re-diffusé");
+        assert_eq!(label_of(&deltas, "10.0.0.1").unwrap(), "nas.local");
+
+        // Le snapshot utilise aussi le nom.
+        let snap = tables.snapshot_deltas();
+        assert_eq!(label_of(&snap, "10.0.0.1").unwrap(), "nas.local");
+        assert_eq!(label_of(&snap, "10.0.0.2").unwrap(), "10.0.0.2");
+
+        // Fade complet puis retour du trafic : le nom (cache) est réutilisé.
+        tables.fade_sweep(t0 + Duration::from_secs(120), Duration::from_secs(60));
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                10,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            t0 + Duration::from_secs(121),
+        );
+        let deltas = tables.drain_deltas();
+        assert_eq!(label_of(&deltas, "10.0.0.1").unwrap(), "nas.local");
     }
 
     #[test]

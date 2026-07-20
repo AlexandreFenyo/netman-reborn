@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use netman::capture::{self, CaptureStats};
 use netman::model::packet::{self, PacketMeta};
 use netman::model::tables::Tables;
+use netman::resolve;
 use netman::server::{self, AppState};
 
 #[derive(Parser, Debug)]
@@ -188,6 +189,14 @@ async fn aggregate_loop(
     let mut capture_done = false;
     let mut last_log = Instant::now();
 
+    // Résolveur PTR : demandes déclenchées une seule fois par IP (les échecs
+    // d'envoi — file pleine — seront retentés au tick suivant).
+    let (ptr_results_tx, mut ptr_results_rx) =
+        mpsc::channel::<(std::net::IpAddr, String)>(resolve::dns::REQUEST_QUEUE);
+    let ptr_req_tx = resolve::dns::spawn(ptr_results_tx);
+    let mut ptr_requested: std::collections::HashSet<std::net::IpAddr> =
+        std::collections::HashSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -203,15 +212,29 @@ async fn aggregate_loop(
                     tables.ingest(&meta, now);
                 }
             }
+            resolved = ptr_results_rx.recv() => {
+                let Some((ip, name)) = resolved else { return };
+                let Ok(mut tables) = tables.lock() else { return };
+                tables.set_l3_label(ip, name);
+            }
             _ = tick.tick() => {
-                let deltas = {
+                let (deltas, dirty_ips) = {
                     let Ok(mut tables) = tables.lock() else { return };
+                    let dirty_ips = tables.dirty_l3_node_ips();
                     let mut deltas = tables.drain_deltas();
                     // Vieillissement : suppressions explicites (invariant 7).
                     let max_age = Duration::from_secs(fade_secs.load(Ordering::Relaxed));
                     deltas.extend(tables.fade_sweep(Instant::now(), max_age));
-                    deltas
+                    (deltas, dirty_ips)
                 };
+                for ip in dirty_ips {
+                    if resolve::dns::is_resolvable(&ip)
+                        && !ptr_requested.contains(&ip)
+                        && ptr_req_tx.try_send(ip).is_ok()
+                    {
+                        ptr_requested.insert(ip);
+                    }
+                }
                 for delta in &deltas {
                     if let Some(msg) = server::encode_delta(delta) {
                         // Erreur = aucun client connecté : sans importance.
