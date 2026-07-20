@@ -12,7 +12,7 @@ navigateur et alimentés par **une seule capture réseau**.
 - Outil **strictement passif** : capture et affichage, aucune injection.
 
 > **Pourquoi ce projet ?** J'ai utilisé les outils originaux de la suite
-> Netman (Etherman, Interman…) sur station **Sun SPARC sous SunOS 4.1.2**,
+> Netman (Etherman, Interman…) sur station **Sun SPARC sous SunOS 4.1.3**,
 > **au tout début des années 1990**, à
 > **[Télécom Paris](https://www.telecom-paris.fr/)**, mon école d'ingénieur.
 > Ce dépôt en est une recréation moderne, fidèle à leur esthétique et à leur
