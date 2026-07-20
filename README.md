@@ -11,6 +11,8 @@ navigateur et alimentés par **une seule capture réseau**.
   (classful IPv4, /64 IPv6), les réseaux répartis sur un anneau.
 - Outil **strictement passif** : capture et affichage, aucune injection.
 
+![Netman Reborn — Etherman (L2) et Interman (L3) côte à côte, sur trafic réel](docs/screenshot.png)
+
 ## Prérequis
 
 - **Windows** (10/11). La capture est native Windows via **Npcap** — ne pas
