@@ -7,8 +7,8 @@ navigateur et alimentés par **une seule capture réseau**.
 
 - Backend **Rust** : capture Npcap, agrégation, serveur HTTP/WebSocket (axum).
 - Frontend **sigma.js v3** + graphology : Etherman dispose ses stations sur
-  un cercle (réseau L2 plat), Interman anime ses réseaux au ForceAtlas2
-  continu (web worker) — les nœuds se placent à mesure que le trafic arrive.
+  un cercle (réseau L2 plat) ; Interman dessine un cercle par réseau
+  (classful IPv4, /64 IPv6), les réseaux répartis sur un anneau.
 - Outil **strictement passif** : capture et affichage, aucune injection.
 
 ## Prérequis
@@ -71,7 +71,10 @@ et le serveur.
   traversent le cercle, comme dans l'Etherman de 1993.
 - **Interman (droite)** : un nœud par adresse IP (v4/v6, y compris réseaux
   distants), renommé automatiquement dès que le reverse-DNS (PTR) aboutit ;
-  une arête par conversation L3.
+  une arête par conversation L3. Les hôtes d'un même réseau **classful**
+  (classe A → /8, classe B → /16, classe C → /24 ; multicast à part ;
+  IPv6 regroupé par /64) forment **un cercle par réseau**, les réseaux se
+  répartissant sur un anneau.
 - **Mapping visuel** : taille de nœud et épaisseur d'arête ∝ log(octets
   cumulés) ; couleur = protocole dominant (légende en pied de page).
 - **Contrôles** :

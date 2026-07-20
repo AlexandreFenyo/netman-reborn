@@ -90,15 +90,54 @@ const SIGMA_SETTINGS = {
   },
 };
 
+/* --- Regroupement Interman par réseau.
+ * IPv4 : réseau classful — classe A → /8, classe B → /16, classe C → /24,
+ * classes D/E (multicast & réservé) dans un groupe à part.
+ * IPv6 : préfixe /64 (l'équivalent moderne du « réseau » local). */
+
+function expandIpv6(ip) {
+  const [head, tail = ""] = ip.split("::");
+  const headParts = head ? head.split(":") : [];
+  const tailParts = tail ? tail.split(":") : [];
+  const missing = Math.max(8 - headParts.length - tailParts.length, 0);
+  return [...headParts, ...Array(missing).fill("0"), ...tailParts];
+}
+
+function networkKey(id) {
+  if (id.includes(":")) {
+    return "v6 " + expandIpv6(id).slice(0, 4).join(":") + "::/64";
+  }
+  const o = id.split(".").map(Number);
+  if (o[0] < 128) return `${o[0]}.0.0.0/8`;
+  if (o[0] < 192) return `${o[0]}.${o[1]}.0.0/16`;
+  if (o[0] < 224) return `${o[0]}.${o[1]}.${o[2]}.0/24`;
+  return "multicast & reserved";
+}
+
+/* Tri : IPv4 par octets (10.0.0.2 avant 10.0.0.10), le reste lexicographique. */
+function compareNodeIds(a, b) {
+  if (!a.includes(":") && !b.includes(":")) {
+    const ao = a.split(".").map(Number);
+    const bo = b.split(".").map(Number);
+    for (let i = 0; i < 4; i++) {
+      if (ao[i] !== bo[i]) return ao[i] - bo[i];
+    }
+    return 0;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /* --- Deux vues indépendantes : graphe graphology + sigma + supervisor FA2. */
 
 class GraphView {
-  /* mode "force"  : ForceAtlas2 continu (Interman — plusieurs réseaux,
-   *                 la topologie émerge des forces) ;
-   * mode "circle" : nœuds répartis sur un grand cercle (Etherman — un
-   *                 réseau L2 est plat, toutes les stations sont sur le même
-   *                 segment ; les conversations traversent le cercle, comme
-   *                 dans l'Etherman de 1993). */
+  /* mode "circle"   : nœuds répartis sur un grand cercle (Etherman — un
+   *                    réseau L2 est plat, toutes les stations sont sur le
+   *                    même segment ; les conversations traversent le cercle,
+   *                    comme dans l'Etherman de 1993) ;
+   * mode "networks" : un cercle par réseau (Interman — les hôtes d'un même
+   *                    réseau classful A/B/C, ou /64 en IPv6, forment un
+   *                    cercle ; les réseaux se répartissent sur un anneau) ;
+   * mode "force"    : ForceAtlas2 continu (non utilisé actuellement). */
   constructor(containerId, mode = "force") {
     this.mode = mode;
     this.graph = new graphology.Graph();
@@ -128,6 +167,49 @@ class GraphView {
       this.graph.setNodeAttribute(id, "x", radius * Math.cos(angle));
       this.graph.setNodeAttribute(id, "y", radius * Math.sin(angle));
     });
+  }
+
+  /* Un cercle par réseau, les centres des réseaux répartis sur un anneau
+   * dont le rayon s'adapte pour que les cercles ne se chevauchent pas.
+   * Tout est trié → placement déterministe et stable. */
+  networksLayout() {
+    const groups = new Map();
+    this.graph.forEachNode((id) => {
+      const key = networkKey(id);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(id);
+    });
+    const keys = [...groups.keys()].sort();
+    const clusterRadius = (count) =>
+      count === 1 ? 0 : Math.max(16, (count * 10) / (2 * Math.PI));
+    let maxRadius = 0;
+    for (const key of keys) {
+      maxRadius = Math.max(maxRadius, clusterRadius(groups.get(key).length));
+    }
+    const networkCount = keys.length;
+    const ringRadius =
+      networkCount === 1
+        ? 0
+        : Math.max(150, (networkCount * (2 * maxRadius + 50)) / (2 * Math.PI));
+    keys.forEach((key, ki) => {
+      const centerAngle = (2 * Math.PI * ki) / networkCount - Math.PI / 2;
+      const cx = ringRadius * Math.cos(centerAngle);
+      const cy = ringRadius * Math.sin(centerAngle);
+      const members = groups.get(key).sort(compareNodeIds);
+      const radius = clusterRadius(members.length);
+      members.forEach((id, i) => {
+        const angle = (2 * Math.PI * i) / members.length - Math.PI / 2;
+        this.graph.setNodeAttribute(id, "x", cx + radius * Math.cos(angle));
+        this.graph.setNodeAttribute(id, "y", cy + radius * Math.sin(angle));
+      });
+    });
+  }
+
+  /* Applique le layout du mode courant après une mutation de topologie. */
+  relayout() {
+    if (this.mode === "circle") this.circleLayout();
+    else if (this.mode === "networks") this.networksLayout();
+    else this.ensureLayout();
   }
 
   /* Position initiale près du barycentre des nœuds existants. */
@@ -167,10 +249,7 @@ class GraphView {
       attrs.y = pos.y;
     }
     this.graph.mergeNode(id, attrs);
-    if (isNew) {
-      if (this.mode === "circle") this.circleLayout();
-      else this.ensureLayout();
-    }
+    if (isNew) this.relayout();
   }
 
   /* Garde-fou : si une arête arrive avant ses extrémités (delta de nœud
@@ -195,7 +274,7 @@ class GraphView {
 
   removeNode(id) {
     if (this.graph.hasNode(id)) this.graph.dropNode(id);
-    if (this.mode === "circle") this.circleLayout();
+    if (this.mode !== "force") this.relayout();
     if (this.graph.order === 0) this.resetLayout();
   }
 
@@ -218,7 +297,7 @@ class GraphView {
 
 const views = {
   ether: new GraphView("graph-ether", "circle"),
-  inter: new GraphView("graph-inter", "force"),
+  inter: new GraphView("graph-inter", "networks"),
 };
 
 /* --- Application des deltas. */
