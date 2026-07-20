@@ -42,9 +42,16 @@ const PROTO_COLORS = {
 };
 const OTHER_COLOR = "#697386";
 const DIMMED_COLOR = "#2a3040";
+/* Transparence des arêtes (alpha hex) : les chevauchements se voient par
+ * accumulation — deux liens superposés apparaissent plus denses qu'un seul. */
+const EDGE_ALPHA = "8c"; /* ≈ 55 % */
 
 function protoColor(proto) {
   return PROTO_COLORS[proto] || OTHER_COLOR;
+}
+
+function edgeColor(proto) {
+  return protoColor(proto) + EDGE_ALPHA;
 }
 
 function nodeSize(bytes) {
@@ -154,7 +161,7 @@ class GraphView {
     this.ensureEndpoint(target);
     this.graph.mergeEdgeWithKey(id, source, target, {
       size: edgeSize(bytes),
-      color: protoColor(proto),
+      color: edgeColor(proto),
       bytes,
       packets,
       proto,
