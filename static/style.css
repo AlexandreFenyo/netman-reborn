@@ -96,6 +96,9 @@ body { display: flex; flex-direction: column; }
 }
 
 .panel h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: 0.85rem;
   font-weight: 600;
   color: var(--muted);
@@ -103,6 +106,21 @@ body { display: flex; flex-direction: column; }
   letter-spacing: 0.08em;
   padding: 0.45rem 0.9rem;
   border-bottom: 1px solid var(--panel-border);
+}
+
+.width-control {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.72rem;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.width-control input[type="range"] {
+  width: 110px;
+  accent-color: var(--accent);
 }
 
 .graph { flex: 1; min-height: 0; }

@@ -9,9 +9,14 @@
  * absolus : un delta manqué est réparé par le suivant.
  *
  * Mapping visuel (fixe, documenté, légende en pied de page) :
- *   - taille de nœud   ∝ log2(octets cumulés)  [2 .. 18]
- *   - épaisseur d'arête ∝ log2(octets cumulés) [0.5 .. 7]
+ *   - taille de nœud    ∝ log2(octets cumulés)  [2 .. 18]
+ *   - épaisseur d'arête ∝ log2(débit observé)   [0.4 .. 12], amplification
+ *     réglable par vue (slider « Link width » de chaque panneau)
  *   - couleur = protocole dominant (palette PROTO_COLORS)
+ *
+ * Débit : les upserts portent des cumuls absolus ; le client en dérive un
+ * débit lissé (EWMA, constante RATE_TAU) et le fait décroître vers zéro
+ * quand une arête ne reçoit plus de mises à jour.
  */
 
 "use strict";
@@ -58,8 +63,14 @@ function nodeSize(bytes) {
   return Math.min(18, Math.max(2, 2 + Math.log2(1 + bytes) * 0.75));
 }
 
-function edgeSize(bytes) {
-  return Math.min(7, Math.max(0.5, 0.5 + Math.log2(1 + bytes) * 0.35));
+/* Constante de temps (s) du lissage/décroissance du débit des arêtes. */
+const RATE_TAU = 3;
+const RATE_DECAY = Math.exp(-1 / RATE_TAU);
+
+/* Épaisseur ∝ log2 du débit (octets/s), amplifiée par le slider de la vue :
+ * ~1 kB/s → 1.6 px, ~1 MB/s → 5 px, ~100 MB/s → 8 px (à scale 1). */
+function edgeWidth(rate, scale) {
+  return Math.min(12, 0.4 + 0.35 * scale * Math.log2(1 + rate / 100));
 }
 
 /* --- Filtre protocole (piloté par le <select>, appliqué via les reducers
@@ -68,7 +79,7 @@ function edgeSize(bytes) {
 
 let protoFilter = "";
 
-const SIGMA_SETTINGS = {
+const SIGMA_BASE_SETTINGS = {
   labelColor: { color: "#aeb6c4" },
   labelSize: 11,
   labelRenderedSizeThreshold: 5,
@@ -76,18 +87,6 @@ const SIGMA_SETTINGS = {
   defaultEdgeColor: "#333a48",
   minCameraRatio: 0.05,
   maxCameraRatio: 20,
-  nodeReducer: (_node, data) => {
-    if (protoFilter && data.proto !== protoFilter) {
-      return { ...data, color: DIMMED_COLOR, label: null, size: Math.min(data.size, 3) };
-    }
-    return data;
-  },
-  edgeReducer: (_edge, data) => {
-    if (protoFilter && data.proto !== protoFilter) {
-      return { ...data, hidden: true };
-    }
-    return data;
-  },
 };
 
 /* --- Regroupement Interman par réseau.
@@ -141,7 +140,25 @@ class GraphView {
   constructor(containerId, mode = "force") {
     this.mode = mode;
     this.graph = new graphology.Graph();
-    this.renderer = new Sigma(this.graph, document.getElementById(containerId), SIGMA_SETTINGS);
+    /* Amplification de « épaisseur ∝ débit », pilotée par le slider du
+     * panneau. Appliquée dans l'edgeReducer : purement visuel, aucun
+     * recalcul d'attributs au changement de slider. */
+    this.widthScale = 1;
+    this.renderer = new Sigma(this.graph, document.getElementById(containerId), {
+      ...SIGMA_BASE_SETTINGS,
+      nodeReducer: (_node, data) => {
+        if (protoFilter && data.proto !== protoFilter) {
+          return { ...data, color: DIMMED_COLOR, label: null, size: Math.min(data.size, 3) };
+        }
+        return data;
+      },
+      edgeReducer: (_edge, data) => {
+        if (protoFilter && data.proto !== protoFilter) {
+          return { ...data, hidden: true };
+        }
+        return { ...data, size: edgeWidth(data.rate || 0, this.widthScale) };
+      },
+    });
     this.layout = null;
   }
 
@@ -263,12 +280,33 @@ class GraphView {
     registerProto(proto);
     this.ensureEndpoint(source);
     this.ensureEndpoint(target);
+    /* Débit lissé (EWMA) dérivé des cumuls absolus successifs. */
+    const now = performance.now() / 1000;
+    let rate = 0;
+    let prevBytes = bytes;
+    let prevTime = now;
+    if (this.graph.hasEdge(id)) {
+      const prev = this.graph.getEdgeAttributes(id);
+      const dt = now - (prev.prevTime ?? now);
+      if (dt >= 0.05) {
+        const inst = Math.max(0, bytes - (prev.prevBytes ?? bytes)) / dt;
+        const alpha = 1 - Math.exp(-dt / RATE_TAU);
+        rate = (prev.rate || 0) + alpha * (inst - (prev.rate || 0));
+      } else {
+        /* Mise à jour trop rapprochée : on conserve l'état précédent. */
+        rate = prev.rate || 0;
+        prevBytes = prev.prevBytes ?? bytes;
+        prevTime = prev.prevTime ?? now;
+      }
+    }
     this.graph.mergeEdgeWithKey(id, source, target, {
-      size: edgeSize(bytes),
       color: edgeColor(proto),
       bytes,
       packets,
       proto,
+      rate,
+      prevBytes,
+      prevTime,
     });
   }
 
@@ -299,6 +337,20 @@ const views = {
   ether: new GraphView("graph-ether", "circle"),
   inter: new GraphView("graph-inter", "networks"),
 };
+
+/* Décroissance du débit des arêtes muettes (le serveur n'envoie d'upsert que
+ * quand une conversation change) : sans nouvelles données depuis 2 s, le
+ * débit affiché fond vers zéro avec la même constante de temps. */
+setInterval(() => {
+  const now = performance.now() / 1000;
+  for (const view of Object.values(views)) {
+    view.graph.forEachEdge((edge, attrs) => {
+      if ((attrs.rate || 0) > 1 && now - (attrs.prevTime ?? now) > 2) {
+        view.graph.setEdgeAttribute(edge, "rate", attrs.rate * RATE_DECAY);
+      }
+    });
+  }
+}, 1000);
 
 /* --- Application des deltas. */
 
@@ -366,6 +418,15 @@ filterEl.addEventListener("change", () => {
     view.renderer.refresh({ skipIndexation: true });
   }
 });
+
+/* Sliders « Link width » : un par vue, amplifie/réduit épaisseur ∝ débit. */
+for (const [key, view] of Object.entries(views)) {
+  const slider = document.getElementById(`width-${key}`);
+  slider.addEventListener("input", () => {
+    view.widthScale = Number(slider.value);
+    view.renderer.refresh({ skipIndexation: true });
+  });
+}
 
 /* Réglage du fade : slider → serveur ; le serveur renvoie {type:"config"} à
  * tous les clients (y compris l'émetteur), qui fait foi. */

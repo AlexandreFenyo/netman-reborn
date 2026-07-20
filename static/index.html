@@ -24,11 +24,21 @@
   </header>
   <main id="panels">
     <section class="panel">
-      <h2>Etherman — Layer 2 (MAC)</h2>
+      <h2>Etherman — Layer 2 (MAC)
+        <label class="width-control" title="Link width reflects observed throughput — amplify or reduce the effect">
+          Link width
+          <input type="range" id="width-ether" min="0" max="3" step="0.1" value="1">
+        </label>
+      </h2>
       <div id="graph-ether" class="graph"></div>
     </section>
     <section class="panel">
-      <h2>Interman — Layer 3 (IP)</h2>
+      <h2>Interman — Layer 3 (IP)
+        <label class="width-control" title="Link width reflects observed throughput — amplify or reduce the effect">
+          Link width
+          <input type="range" id="width-inter" min="0" max="3" step="0.1" value="1">
+        </label>
+      </h2>
       <div id="graph-inter" class="graph"></div>
     </section>
   </main>

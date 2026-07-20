@@ -75,8 +75,10 @@ et le serveur.
   (classe A → /8, classe B → /16, classe C → /24 ; multicast à part ;
   IPv6 regroupé par /64) forment **un cercle par réseau**, les réseaux se
   répartissant sur un anneau.
-- **Mapping visuel** : taille de nœud et épaisseur d'arête ∝ log(octets
-  cumulés) ; couleur = protocole dominant (légende en pied de page).
+- **Mapping visuel** : taille de nœud ∝ log(octets cumulés) ; épaisseur
+  d'arête ∝ log(**débit observé**, lissé sur ~3 s, décroissant quand le
+  trafic cesse), avec un slider « Link width » par panneau pour amplifier ou
+  réduire l'effet ; couleur = protocole dominant (légende en pied de page).
 - **Contrôles** :
   - *Pause / Resume* — gèle les deux vues (la capture continue ; la reprise
     resynchronise sur l'état serveur) ;
