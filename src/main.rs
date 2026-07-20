@@ -1,19 +1,21 @@
 //! Netman Reborn — Etherman (L2) + Interman (L3), moniteur passif.
-//! Jalon 2 : parsing + double agrégation, top talkers en console.
+//! Jalon 3 : serveur axum + WebSocket diffusant les deltas de graphe.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use axum::extract::ws::Utf8Bytes;
 use clap::Parser;
+use tokio::sync::{broadcast, mpsc};
 
 use netman::capture::{self, CaptureStats};
 use netman::model::packet::{self, PacketMeta};
 use netman::model::tables::Tables;
+use netman::server::{self, AppState};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,17 +31,25 @@ struct Cli {
     #[arg(long, value_name = "FILE", conflicts_with = "iface")]
     pcap_file: Option<PathBuf>,
 
-    /// HTTP/WebSocket listen port (used from milestone 3 on)
+    /// HTTP/WebSocket listen port
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
     /// Fade timeout in seconds: nodes/edges unseen for this long are removed
     #[arg(long, default_value_t = 60)]
     fade: u64,
+
+    /// Directory of frontend static files served at /
+    #[arg(long, default_value = "static")]
+    static_dir: String,
 }
 
 /// Capacité du channel capture→agrégateur. Plein ⇒ on jette (invariant 5).
 const CHANNEL_CAPACITY: usize = 65536;
+/// Capacité du broadcast des deltas (ring ; les clients lents « laggent »).
+const BROADCAST_CAPACITY: usize = 4096;
+/// Période du tick de diffusion.
+const TICK: Duration = Duration::from_millis(250);
 
 fn main() -> anyhow::Result<()> {
     netman::setup_npcap_dll_path();
@@ -52,25 +62,11 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    tracing::info!(
-        port = cli.port,
-        fade = cli.fade,
-        "netman starting (milestone 2)"
-    );
-
     let stats = Arc::new(CaptureStats::default());
     let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = Arc::clone(&shutdown);
-        ctrlc::set_handler(move || {
-            eprintln!("\nshutting down...");
-            shutdown.store(true, Ordering::Relaxed);
-        })
-        .context("failed to install Ctrl-C handler")?;
-    }
 
     // Channel capture → agrégateur (découplage, invariant 2).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PacketMeta>(CHANNEL_CAPACITY);
+    let (meta_tx, meta_rx) = mpsc::channel::<PacketMeta>(CHANNEL_CAPACITY);
 
     // Thread OS dédié à la boucle pcap bloquante. Il ne fait que :
     // capture → parse → try_send (jamais bloquant, invariant 5).
@@ -81,7 +77,7 @@ fn main() -> anyhow::Result<()> {
             let stats = Arc::clone(&stats);
             move |data: &[u8], wire_len: u32| match packet::parse_frame(data, wire_len) {
                 Some(meta) => {
-                    if let Err(TrySendError::Full(_)) = tx.try_send(meta) {
+                    if meta_tx.try_send(meta).is_err() {
                         stats.chan_drops.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -114,84 +110,117 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Agrégateur : consomme les PacketMeta, maintient les deux tables,
-    // affiche stats + top talkers toutes les 2 s.
-    let mut tables = Tables::new();
-    let mut last_dump = Instant::now();
-    let mut last_frames = 0u64;
-    let mut last_bytes = 0u64;
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(meta) => tables.ingest(&meta, Instant::now()),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break, // thread capture terminé
-        }
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        if last_dump.elapsed() >= Duration::from_secs(2) {
-            last_dump = Instant::now();
-            let frames = stats.frames.load(Ordering::Relaxed);
-            let bytes = stats.bytes.load(Ordering::Relaxed);
-            dump_top_talkers(
-                &tables,
-                (frames - last_frames) / 2,
-                (bytes - last_bytes) / 2,
-                &stats,
-            );
-            last_frames = frames;
-            last_bytes = bytes;
-        }
-    }
+    // Runtime tokio : agrégateur + serveur HTTP/WS.
+    let runtime = tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
+    let result = runtime.block_on(async_main(&cli, Arc::clone(&stats), meta_rx));
 
-    // Draine ce qui reste (fin de fichier pcap notamment) avant le bilan.
-    while let Ok(meta) = rx.try_recv() {
-        tables.ingest(&meta, Instant::now());
-    }
-
+    // Arrêt : flag pour la boucle pcap (réveillée par son timeout), puis join
+    // hors runtime (jamais de join bloquant dans une tâche async).
     shutdown.store(true, Ordering::Relaxed);
+    drop(runtime);
     match capture_thread.join() {
-        Ok(result) => result.context("capture failed")?,
+        Ok(capture_result) => capture_result.context("capture failed")?,
         Err(_) => anyhow::bail!("capture thread panicked"),
     }
+    tracing::info!(
+        frames = stats.frames.load(Ordering::Relaxed),
+        kernel_drops = stats.kernel_drops.load(Ordering::Relaxed),
+        chan_drops = stats.chan_drops.load(Ordering::Relaxed),
+        "netman stopped"
+    );
+    result
+}
 
-    println!("\n=== Final summary ===");
-    dump_top_talkers(&tables, 0, 0, &stats);
+async fn async_main(
+    cli: &Cli,
+    stats: Arc<CaptureStats>,
+    meta_rx: mpsc::Receiver<PacketMeta>,
+) -> anyhow::Result<()> {
+    let tables = Arc::new(Mutex::new(Tables::new()));
+    let (deltas_tx, _) = broadcast::channel::<Utf8Bytes>(BROADCAST_CAPACITY);
+
+    tokio::spawn(aggregate_loop(
+        meta_rx,
+        Arc::clone(&tables),
+        deltas_tx.clone(),
+        Arc::clone(&stats),
+    ));
+
+    let state = AppState { tables, deltas_tx };
+    let app = server::router(state, &cli.static_dir);
+    let addr = format!("127.0.0.1:{}", cli.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("cannot listen on {addr}"))?;
+    println!("Serving on http://{addr} (Ctrl-C to stop)");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("\nshutting down...");
+        })
+        .await
+        .context("http server failed")?;
     Ok(())
 }
 
-fn dump_top_talkers(tables: &Tables, fps: u64, bps: u64, stats: &CaptureStats) {
-    println!(
-        "\n-- {} frames/s | {}/s | L2 convs: {} | L3 convs: {} | kernel drops {} | chan drops {} | unparsed {}",
-        fps,
-        human_bytes(bps),
-        tables.l2.len(),
-        tables.l3.len(),
-        stats.kernel_drops.load(Ordering::Relaxed),
-        stats.chan_drops.load(Ordering::Relaxed),
-        stats.parse_errors.load(Ordering::Relaxed),
-    );
-    println!("   Top talkers — Etherman (L2/MAC):");
-    for (key, conv) in tables.top_l2(5) {
-        println!(
-            "     {} <-> {}  {:<10} {:>10}  {:>7} pkts",
-            key.0,
-            key.1,
-            conv.dominant_proto().to_string(),
-            human_bytes(conv.bytes),
-            conv.packets,
-        );
-    }
-    println!("   Top talkers — Interman (L3/IP):");
-    for (key, conv) in tables.top_l3(5) {
-        println!(
-            "     {} <-> {}  {:<10} {:>10}  {:>7} pkts",
-            key.0,
-            key.1,
-            conv.dominant_proto().to_string(),
-            human_bytes(conv.bytes),
-            conv.packets,
-        );
+/// Agrégateur : consomme les PacketMeta par lots, maintient les tables,
+/// diffuse les deltas des entrées modifiées à chaque tick.
+async fn aggregate_loop(
+    mut meta_rx: mpsc::Receiver<PacketMeta>,
+    tables: Arc<Mutex<Tables>>,
+    deltas_tx: broadcast::Sender<Utf8Bytes>,
+    stats: Arc<CaptureStats>,
+) {
+    let mut buf: Vec<PacketMeta> = Vec::with_capacity(4096);
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut capture_done = false;
+    let mut last_log = Instant::now();
+
+    loop {
+        tokio::select! {
+            biased;
+            received = meta_rx.recv_many(&mut buf, 4096), if !capture_done => {
+                if received == 0 {
+                    // Fin de capture (fichier rejoué) : on continue à servir.
+                    capture_done = true;
+                    continue;
+                }
+                let Ok(mut tables) = tables.lock() else { return };
+                let now = Instant::now();
+                for meta in buf.drain(..) {
+                    tables.ingest(&meta, now);
+                }
+            }
+            _ = tick.tick() => {
+                let deltas = {
+                    let Ok(mut tables) = tables.lock() else { return };
+                    tables.drain_deltas()
+                };
+                for delta in &deltas {
+                    if let Some(msg) = server::encode_delta(delta) {
+                        // Erreur = aucun client connecté : sans importance.
+                        let _ = deltas_tx.send(msg);
+                    }
+                }
+                if last_log.elapsed() >= Duration::from_secs(10) {
+                    last_log = Instant::now();
+                    let (l2, l3) = {
+                        let Ok(tables) = tables.lock() else { return };
+                        (tables.l2.len(), tables.l3.len())
+                    };
+                    tracing::info!(
+                        frames = stats.frames.load(Ordering::Relaxed),
+                        l2_convs = l2,
+                        l3_convs = l3,
+                        clients = deltas_tx.receiver_count(),
+                        chan_drops = stats.chan_drops.load(Ordering::Relaxed),
+                        "aggregator status"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -215,20 +244,5 @@ fn prompt_device(devices: &[pcap::Device]) -> anyhow::Result<pcap::Device> {
             Ok(i) if i < devices.len() => return Ok(devices[i].clone()),
             _ => println!("Invalid choice, expected 0..{}", devices.len() - 1),
         }
-    }
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }

@@ -7,11 +7,12 @@
 //! La clé est normalisée (min, max) pour agréger les deux sens d'une même
 //! conversation, comme EtherApe.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Instant;
 
 use super::packet::{Mac, PacketMeta, Proto};
+use crate::wsproto::{Delta, View};
 
 /// Conversation L2 : paire de MAC ordonnée.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -78,12 +79,20 @@ impl ConvStats {
     }
 }
 
-/// Les deux tables, mises à jour par l'agrégateur (jamais par le thread de
-/// capture directement — découplage par channel, invariant 2).
+/// Les deux tables (conversations + nœuds), mises à jour par l'agrégateur
+/// (jamais par le thread de capture directement — découplage par channel,
+/// invariant 2). Les entrées modifiées depuis le dernier tick sont marquées
+/// « dirty » pour ne diffuser que des deltas.
 #[derive(Default)]
 pub struct Tables {
     pub l2: HashMap<L2Key, ConvStats>,
     pub l3: HashMap<L3Key, ConvStats>,
+    pub l2_nodes: HashMap<Mac, ConvStats>,
+    pub l3_nodes: HashMap<IpAddr, ConvStats>,
+    dirty_l2: HashSet<L2Key>,
+    dirty_l3: HashSet<L3Key>,
+    dirty_l2_nodes: HashSet<Mac>,
+    dirty_l3_nodes: HashSet<IpAddr>,
 }
 
 impl Tables {
@@ -91,19 +100,109 @@ impl Tables {
         Self::default()
     }
 
-    /// Projette une trame sur les deux tables.
+    /// Projette une trame sur les deux tables (conversations + nœuds).
     pub fn ingest(&mut self, meta: &PacketMeta, now: Instant) {
+        let l2_key = L2Key::new(meta.src_mac, meta.dst_mac);
         self.l2
-            .entry(L2Key::new(meta.src_mac, meta.dst_mac))
+            .entry(l2_key)
             .or_insert_with(|| ConvStats::new(now))
             .add(meta.wire_len, meta.l2_proto, now);
+        self.dirty_l2.insert(l2_key);
+        for mac in [meta.src_mac, meta.dst_mac] {
+            self.l2_nodes
+                .entry(mac)
+                .or_insert_with(|| ConvStats::new(now))
+                .add(meta.wire_len, meta.l2_proto, now);
+            self.dirty_l2_nodes.insert(mac);
+        }
 
         if let Some(l3) = &meta.l3 {
+            let l3_key = L3Key::new(l3.src, l3.dst);
             self.l3
-                .entry(L3Key::new(l3.src, l3.dst))
+                .entry(l3_key)
                 .or_insert_with(|| ConvStats::new(now))
                 .add(meta.wire_len, l3.proto, now);
+            self.dirty_l3.insert(l3_key);
+            for ip in [l3.src, l3.dst] {
+                self.l3_nodes
+                    .entry(ip)
+                    .or_insert_with(|| ConvStats::new(now))
+                    .add(meta.wire_len, l3.proto, now);
+                self.dirty_l3_nodes.insert(ip);
+            }
         }
+    }
+
+    /// Deltas des entrées modifiées depuis le dernier appel (puis reset).
+    /// Nœuds avant arêtes, pour que le frontend crée les extrémités d'abord.
+    pub fn drain_deltas(&mut self) -> Vec<Delta> {
+        let mut out = Vec::with_capacity(
+            self.dirty_l2_nodes.len()
+                + self.dirty_l3_nodes.len()
+                + self.dirty_l2.len()
+                + self.dirty_l3.len(),
+        );
+        for mac in self.dirty_l2_nodes.drain() {
+            if let Some(stats) = self.l2_nodes.get(&mac) {
+                out.push(node_delta(View::Ether, mac.to_string(), stats));
+            }
+        }
+        for ip in self.dirty_l3_nodes.drain() {
+            if let Some(stats) = self.l3_nodes.get(&ip) {
+                out.push(node_delta(View::Inter, ip.to_string(), stats));
+            }
+        }
+        for key in self.dirty_l2.drain() {
+            if let Some(stats) = self.l2.get(&key) {
+                out.push(edge_delta(
+                    View::Ether,
+                    key.0.to_string(),
+                    key.1.to_string(),
+                    stats,
+                ));
+            }
+        }
+        for key in self.dirty_l3.drain() {
+            if let Some(stats) = self.l3.get(&key) {
+                out.push(edge_delta(
+                    View::Inter,
+                    key.0.to_string(),
+                    key.1.to_string(),
+                    stats,
+                ));
+            }
+        }
+        out
+    }
+
+    /// État complet sous forme de deltas (snapshot pour un client qui arrive).
+    pub fn snapshot_deltas(&self) -> Vec<Delta> {
+        let mut out = Vec::with_capacity(
+            self.l2_nodes.len() + self.l3_nodes.len() + self.l2.len() + self.l3.len(),
+        );
+        for (mac, stats) in &self.l2_nodes {
+            out.push(node_delta(View::Ether, mac.to_string(), stats));
+        }
+        for (ip, stats) in &self.l3_nodes {
+            out.push(node_delta(View::Inter, ip.to_string(), stats));
+        }
+        for (key, stats) in &self.l2 {
+            out.push(edge_delta(
+                View::Ether,
+                key.0.to_string(),
+                key.1.to_string(),
+                stats,
+            ));
+        }
+        for (key, stats) in &self.l3 {
+            out.push(edge_delta(
+                View::Inter,
+                key.0.to_string(),
+                key.1.to_string(),
+                stats,
+            ));
+        }
+        out
     }
 
     /// Top conversations L2 par octets cumulés.
@@ -120,6 +219,34 @@ impl Tables {
         v.sort_by_key(|(_, conv)| std::cmp::Reverse(conv.bytes));
         v.truncate(n);
         v
+    }
+}
+
+/// Identifiant d'arête stable : les clés étant normalisées, `a|b` est unique.
+fn edge_id(a: &str, b: &str) -> String {
+    format!("{a}|{b}")
+}
+
+fn node_delta(view: View, id: String, stats: &ConvStats) -> Delta {
+    Delta::UpsertNode {
+        view,
+        label: id.clone(),
+        id,
+        bytes: stats.bytes,
+        packets: stats.packets,
+        proto: stats.dominant_proto().to_string(),
+    }
+}
+
+fn edge_delta(view: View, a: String, b: String, stats: &ConvStats) -> Delta {
+    Delta::UpsertEdge {
+        view,
+        id: edge_id(&a, &b),
+        source: a,
+        target: b,
+        bytes: stats.bytes,
+        packets: stats.packets,
+        proto: stats.dominant_proto().to_string(),
     }
 }
 
@@ -236,6 +363,46 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert_eq!(*top[0].0, L2Key::new(MAC_A, mac_c), "plus gros en premier");
         assert_eq!(top[0].1.bytes, 500);
+    }
+
+    #[test]
+    fn drain_deltas_only_dirty_then_empty() {
+        use crate::wsproto::Delta;
+        let mut tables = Tables::new();
+        let now = Instant::now();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+
+        tables.ingest(
+            &meta(
+                MAC_A,
+                MAC_B,
+                100,
+                Proto::Named("IPv4"),
+                Some((ip_a, ip_b, Proto::Named("DNS"))),
+            ),
+            now,
+        );
+
+        // 2 nœuds L2 + 2 nœuds L3 + 1 arête L2 + 1 arête L3 = 6 deltas.
+        let deltas = tables.drain_deltas();
+        assert_eq!(deltas.len(), 6);
+        let edges = deltas
+            .iter()
+            .filter(|d| matches!(d, Delta::UpsertEdge { .. }))
+            .count();
+        assert_eq!(edges, 2);
+
+        // Rien de modifié depuis → aucun delta.
+        assert!(tables.drain_deltas().is_empty());
+
+        // Le snapshot, lui, redonne toujours l'état complet.
+        assert_eq!(tables.snapshot_deltas().len(), 6);
+
+        // Nouvelle trame → seuls les éléments touchés repartent.
+        tables.ingest(&meta(MAC_A, MAC_B, 50, Proto::Named("ARP"), None), now);
+        let deltas = tables.drain_deltas();
+        assert_eq!(deltas.len(), 3, "2 nœuds L2 + 1 arête L2, rien côté L3");
     }
 
     #[test]

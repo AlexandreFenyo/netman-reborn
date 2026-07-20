@@ -3,6 +3,8 @@
 
 pub mod capture;
 pub mod model;
+pub mod server;
+pub mod wsproto;
 
 /// Npcap installe wpcap.dll dans System32\Npcap, hors du chemin de recherche
 /// du loader. wpcap.dll est liée en delay-load (build.rs) : ce répertoire doit
