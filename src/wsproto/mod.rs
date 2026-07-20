@@ -53,19 +53,35 @@ pub enum Delta {
 }
 
 /// Message de contrôle client → serveur.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
     /// Règle le délai de fade (nœuds/arêtes non revus depuis N s → retirés).
     SetFade { seconds: u64 },
+    /// Bascule la capture sur une autre interface (id = nom NPF).
+    SetInterface { id: String },
+}
+
+/// Interface de capture présentée au client.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct IfaceInfo {
+    /// Identifiant stable (nom NPF sous Windows).
+    pub id: String,
+    /// Nom convivial (+ adresses).
+    pub label: String,
 }
 
 /// Message d'information serveur → client, hors mutations de graphe.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerInfo {
     /// Configuration courante (envoyée à la connexion et à chaque changement).
     Config { fade_secs: u64 },
+    /// Interfaces disponibles + interface active (vide en mode fichier).
+    Interfaces {
+        current: Option<String>,
+        interfaces: Vec<IfaceInfo>,
+    },
 }
 
 #[cfg(test)]
@@ -123,6 +139,26 @@ mod tests {
         let cmd: ClientCommand =
             serde_json::from_str(r#"{"type":"set_fade","seconds":120}"#).unwrap();
         assert_eq!(cmd, ClientCommand::SetFade { seconds: 120 });
+
+        let cmd: ClientCommand =
+            serde_json::from_str(r#"{"type":"set_interface","id":"\\Device\\NPF_{X}"}"#).unwrap();
+        assert_eq!(
+            cmd,
+            ClientCommand::SetInterface {
+                id: r"\Device\NPF_{X}".into()
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerInfo::Interfaces {
+                current: Some("npf1".into()),
+                interfaces: vec![IfaceInfo {
+                    id: "npf1".into(),
+                    label: "Intel(R) Ethernet [192.168.0.2]".into()
+                }],
+            })
+            .unwrap(),
+            r#"{"type":"interfaces","current":"npf1","interfaces":[{"id":"npf1","label":"Intel(R) Ethernet [192.168.0.2]"}]}"#
+        );
     }
 
     #[test]

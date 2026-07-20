@@ -19,11 +19,28 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use crate::model::tables::Tables;
-use crate::wsproto::{ClientCommand, Delta, ServerInfo};
+use crate::wsproto::{ClientCommand, Delta, IfaceInfo, ServerInfo};
 
 /// Bornes du délai de fade réglable depuis l'IHM.
 pub const FADE_MIN_SECS: u64 = 5;
 pub const FADE_MAX_SECS: u64 = 3600;
+
+/// Interfaces disponibles + interface active, tenues à jour par le
+/// contrôleur de capture. Vide en mode fichier (sélecteur masqué).
+#[derive(Default)]
+pub struct IfaceState {
+    pub current: Option<String>,
+    pub interfaces: Vec<IfaceInfo>,
+}
+
+impl IfaceState {
+    pub fn to_message(&self) -> ServerInfo {
+        ServerInfo::Interfaces {
+            current: self.current.clone(),
+            interfaces: self.interfaces.clone(),
+        }
+    }
+}
 
 /// État partagé du serveur.
 #[derive(Clone)]
@@ -34,6 +51,9 @@ pub struct AppState {
     pub deltas_tx: broadcast::Sender<Utf8Bytes>,
     /// Délai de fade courant (secondes), réglable par les clients.
     pub fade_secs: Arc<AtomicU64>,
+    pub iface_state: Arc<Mutex<IfaceState>>,
+    /// Demandes de changement d'interface (None en mode fichier).
+    pub iface_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 /// Construit le routeur : `/ws` + fichiers statiques (frontend).
@@ -59,12 +79,12 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     ws.on_upgrade(move |socket| client_loop(socket, state))
 }
 
-/// Encode le message de configuration courant.
-fn encode_config(fade_secs: u64) -> Option<Utf8Bytes> {
-    match serde_json::to_string(&ServerInfo::Config { fade_secs }) {
+/// Encode un message d'information serveur → client.
+pub fn encode_info(info: &ServerInfo) -> Option<Utf8Bytes> {
+    match serde_json::to_string(info) {
         Ok(json) => Some(Utf8Bytes::from(json)),
         Err(e) => {
-            tracing::error!(error = %e, "failed to serialize config");
+            tracing::error!(error = %e, "failed to serialize server info");
             None
         }
     }
@@ -78,10 +98,18 @@ fn handle_client_command(text: &str, state: &AppState) {
             state.fade_secs.store(clamped, Ordering::Relaxed);
             tracing::info!(fade_secs = clamped, "fade timeout updated by client");
             // Propage la nouvelle config à tous les clients connectés.
-            if let Some(msg) = encode_config(clamped) {
+            if let Some(msg) = encode_info(&ServerInfo::Config { fade_secs: clamped }) {
                 let _ = state.deltas_tx.send(msg);
             }
         }
+        Ok(ClientCommand::SetInterface { id }) => match &state.iface_tx {
+            Some(tx) => {
+                if tx.try_send(id).is_err() {
+                    tracing::warn!("interface switch request dropped (queue full)");
+                }
+            }
+            None => tracing::warn!("interface switch requested in offline mode, ignored"),
+        },
         Err(e) => tracing::warn!(error = %e, text, "unrecognized client message"),
     }
 }
@@ -104,8 +132,20 @@ async fn client_loop(socket: WebSocket, state: AppState) {
     };
 
     let (mut sink, mut stream) = socket.split();
-    // Configuration courante d'abord (le slider s'initialise), puis snapshot.
-    if let Some(msg) = encode_config(state.fade_secs.load(Ordering::Relaxed)) {
+    // Configuration + interfaces d'abord (les contrôles s'initialisent),
+    // puis snapshot.
+    let mut preamble: Vec<Utf8Bytes> = Vec::with_capacity(2);
+    if let Some(msg) = encode_info(&ServerInfo::Config {
+        fade_secs: state.fade_secs.load(Ordering::Relaxed),
+    }) {
+        preamble.push(msg);
+    }
+    if let Ok(iface_state) = state.iface_state.lock() {
+        if let Some(msg) = encode_info(&iface_state.to_message()) {
+            preamble.push(msg);
+        }
+    }
+    for msg in preamble {
         if sink.send(Message::Text(msg)).await.is_err() {
             return;
         }

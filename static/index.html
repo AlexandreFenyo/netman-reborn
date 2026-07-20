@@ -12,6 +12,10 @@
     <button id="pause" title="Freeze both views (traffic keeps being captured)">Pause</button>
     <button id="reset" title="Clear both views and rebuild from the current server state">Reset</button>
     <button id="rates" class="active" title="Show the average two-way rate on every link">Rates</button>
+    <label id="iface-control" title="Capture interface (switching restarts the capture)" hidden>
+      Interface
+      <select id="iface"></select>
+    </label>
     <label id="filter-control" title="Highlight a single protocol">
       Protocol
       <select id="filter"><option value="">All protocols</option></select>

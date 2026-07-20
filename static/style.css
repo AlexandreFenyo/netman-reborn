@@ -46,7 +46,7 @@ body { display: flex; flex-direction: column; }
 #topbar button:hover { border-color: var(--accent); }
 #topbar button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
-#filter-control, #fade-control {
+#iface-control, #filter-control, #fade-control {
   display: flex;
   align-items: center;
   gap: 0.45rem;
@@ -54,7 +54,11 @@ body { display: flex; flex-direction: column; }
   color: var(--muted);
 }
 
-#filter-control select {
+#iface-control select {
+  max-width: 260px;
+}
+
+#iface-control select, #filter-control select {
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--panel-border);

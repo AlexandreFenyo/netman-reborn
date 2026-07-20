@@ -635,6 +635,31 @@ function applyConfig(config) {
   fadeValueEl.textContent = fadeLabel(config.fade_secs);
 }
 
+/* Sélecteur d'interface de capture (mode live ; masqué en rejeu de fichier).
+ * Le serveur envoie la liste + l'interface active à la connexion et après
+ * chaque bascule — en cas d'échec côté serveur, le sélecteur se recale. */
+
+const ifaceControlEl = document.getElementById("iface-control");
+const ifaceEl = document.getElementById("iface");
+
+function applyInterfaces(msg) {
+  ifaceControlEl.hidden = msg.interfaces.length === 0;
+  ifaceEl.replaceChildren();
+  for (const iface of msg.interfaces) {
+    const option = document.createElement("option");
+    option.value = iface.id;
+    option.textContent = iface.label;
+    ifaceEl.appendChild(option);
+  }
+  if (msg.current) ifaceEl.value = msg.current;
+}
+
+ifaceEl.addEventListener("change", () => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "set_interface", id: ifaceEl.value }));
+  }
+});
+
 /* --- Légende. */
 
 {
@@ -677,6 +702,8 @@ function connect() {
       const msg = JSON.parse(event.data);
       if (msg.type === "config") {
         applyConfig(msg);
+      } else if (msg.type === "interfaces") {
+        applyInterfaces(msg);
       } else if (!paused) {
         applyDelta(msg);
       }

@@ -18,6 +18,10 @@ pub enum CaptureError {
     NoDevice,
     #[error("interface '{0}' not found (use --iface with an index or a name substring)")]
     IfaceNotFound(String),
+    #[error("cannot spawn capture thread: {0}")]
+    Spawn(#[from] std::io::Error),
+    #[error("capture controller state poisoned")]
+    Poisoned,
 }
 
 /// Compteurs partagés entre le thread de capture et l'affichage.
@@ -133,6 +137,109 @@ pub fn run_live(
                 }
             }
             Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Fabrique le callback par-trame standard : parse → try_send, rien d'autre
+/// (jamais bloquant, invariant 5).
+pub fn make_on_packet(
+    stats: Arc<CaptureStats>,
+    meta_tx: tokio::sync::mpsc::Sender<crate::model::packet::PacketMeta>,
+) -> impl FnMut(&[u8], u32) {
+    move |data, wire_len| match crate::model::packet::parse_frame(data, wire_len) {
+        Some(meta) => {
+            if meta_tx.try_send(meta).is_err() {
+                stats.chan_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        None => {
+            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct RunningCapture {
+    device_id: String,
+    shutdown: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Contrôleur de capture live : permet d'arrêter puis relancer la boucle pcap
+/// sur une autre interface (sélection depuis le navigateur). Il n'y a jamais
+/// qu'UNE capture à la fois (invariant 1) : `switch_to` arrête et joint
+/// l'ancienne boucle avant d'ouvrir la nouvelle. Appels bloquants (join ≤
+/// timeout pcap) : à exécuter hors du runtime (spawn_blocking).
+pub struct Controller {
+    stats: Arc<CaptureStats>,
+    meta_tx: tokio::sync::mpsc::Sender<crate::model::packet::PacketMeta>,
+    running: std::sync::Mutex<Option<RunningCapture>>,
+}
+
+impl Controller {
+    pub fn new(
+        stats: Arc<CaptureStats>,
+        meta_tx: tokio::sync::mpsc::Sender<crate::model::packet::PacketMeta>,
+    ) -> Self {
+        Controller {
+            stats,
+            meta_tx,
+            running: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Id (nom NPF) de l'interface en cours de capture.
+    pub fn current(&self) -> Option<String> {
+        self.running
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|r| r.device_id.clone()))
+    }
+
+    /// Bascule la capture sur `wanted` (index, sous-chaîne ou nom NPF).
+    /// Renvoie le label convivial de la nouvelle interface.
+    pub fn switch_to(&self, wanted: &str) -> Result<String, CaptureError> {
+        let devices = list_devices()?;
+        let device = find_device(&devices, wanted)?;
+        let label = device_label(&device);
+        let device_id = device.name.clone();
+
+        self.stop();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stats = Arc::clone(&self.stats);
+            let shutdown = Arc::clone(&shutdown);
+            let on_packet = make_on_packet(Arc::clone(&self.stats), self.meta_tx.clone());
+            std::thread::Builder::new()
+                .name("pcap-capture".into())
+                .spawn(move || {
+                    if let Err(e) = run_live(device, stats, shutdown, on_packet) {
+                        tracing::error!(error = %e, "capture loop failed");
+                    }
+                })?
+        };
+        let mut guard = self.running.lock().map_err(|_| CaptureError::Poisoned)?;
+        *guard = Some(RunningCapture {
+            device_id,
+            shutdown,
+            thread,
+        });
+        Ok(label)
+    }
+
+    /// Arrête la capture courante (flag + join ; la boucle se réveille sur son
+    /// timeout pcap en ≤ ~500 ms).
+    pub fn stop(&self) {
+        let running = match self.running.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => return,
+        };
+        if let Some(running) = running {
+            running.shutdown.store(true, Ordering::Relaxed);
+            if running.thread.join().is_err() {
+                tracing::error!("capture thread panicked");
+            }
         }
     }
 }

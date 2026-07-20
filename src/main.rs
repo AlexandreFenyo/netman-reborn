@@ -13,10 +13,11 @@ use clap::Parser;
 use tokio::sync::{broadcast, mpsc};
 
 use netman::capture::{self, CaptureStats};
-use netman::model::packet::{self, PacketMeta};
+use netman::model::packet::PacketMeta;
 use netman::model::tables::Tables;
 use netman::resolve;
-use netman::server::{self, AppState};
+use netman::server::{self, AppState, IfaceState};
+use netman::wsproto::IfaceInfo;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,59 +70,62 @@ fn main() -> anyhow::Result<()> {
     // Channel capture → agrégateur (découplage, invariant 2).
     let (meta_tx, meta_rx) = mpsc::channel::<PacketMeta>(CHANNEL_CAPACITY);
 
-    // Thread OS dédié à la boucle pcap bloquante. Il ne fait que :
-    // capture → parse → try_send (jamais bloquant, invariant 5).
-    let capture_thread = {
+    // Mode fichier : thread de rejeu simple. Mode live : contrôleur de
+    // capture (permet la bascule d'interface depuis le navigateur).
+    let mut offline_thread = None;
+    let mut controller = None;
+    let iface_state = Arc::new(Mutex::new(IfaceState::default()));
+
+    if let Some(file) = cli.pcap_file.clone() {
+        println!("Replaying {} (offline mode)...", file.display());
         let stats = Arc::clone(&stats);
         let shutdown = Arc::clone(&shutdown);
-        let on_packet = {
-            let stats = Arc::clone(&stats);
-            move |data: &[u8], wire_len: u32| match packet::parse_frame(data, wire_len) {
-                Some(meta) => {
-                    if meta_tx.try_send(meta).is_err() {
-                        stats.chan_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                None => {
-                    stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        };
-
-        if let Some(file) = cli.pcap_file.clone() {
-            println!("Replaying {} (offline mode)...", file.display());
+        let on_packet = capture::make_on_packet(Arc::clone(&stats), meta_tx.clone());
+        offline_thread = Some(
             std::thread::Builder::new()
                 .name("pcap-capture".into())
                 .spawn(move || capture::run_file(&file, stats, shutdown, on_packet))
-                .context("failed to spawn capture thread")?
-        } else {
-            let devices = capture::list_devices().context("cannot enumerate capture interfaces")?;
-            let device = match &cli.iface {
-                Some(wanted) => capture::find_device(&devices, wanted)?,
-                None => prompt_device(&devices)?,
-            };
-            println!(
-                "Capturing on: {} (promiscuous)",
-                capture::device_label(&device)
-            );
-            std::thread::Builder::new()
-                .name("pcap-capture".into())
-                .spawn(move || capture::run_live(device, stats, shutdown, on_packet))
-                .context("failed to spawn capture thread")?
-        }
-    };
+                .context("failed to spawn capture thread")?,
+        );
+    } else {
+        let devices = capture::list_devices().context("cannot enumerate capture interfaces")?;
+        let device = match &cli.iface {
+            Some(wanted) => capture::find_device(&devices, wanted)?,
+            None => prompt_device(&devices)?,
+        };
+        let ctl = Arc::new(capture::Controller::new(
+            Arc::clone(&stats),
+            meta_tx.clone(),
+        ));
+        let label = ctl.switch_to(&device.name)?;
+        println!("Capturing on: {label} (promiscuous)");
+        refresh_iface_state(&ctl, &iface_state);
+        controller = Some(ctl);
+    }
+    drop(meta_tx); // les threads de capture détiennent leurs clones
 
     // Runtime tokio : agrégateur + serveur HTTP/WS.
     let runtime = tokio::runtime::Runtime::new().context("failed to start tokio runtime")?;
-    let result = runtime.block_on(async_main(&cli, Arc::clone(&stats), meta_rx));
+    let result = runtime.block_on(async_main(
+        &cli,
+        Arc::clone(&stats),
+        meta_rx,
+        controller.clone(),
+        Arc::clone(&iface_state),
+    ));
 
-    // Arrêt : flag pour la boucle pcap (réveillée par son timeout), puis join
-    // hors runtime (jamais de join bloquant dans une tâche async).
+    // Arrêt : flag/stop pour la boucle pcap (réveillée par son timeout), puis
+    // join hors runtime (jamais de join bloquant dans une tâche async).
     shutdown.store(true, Ordering::Relaxed);
     drop(runtime);
-    match capture_thread.join() {
-        Ok(capture_result) => capture_result.context("capture failed")?,
-        Err(_) => anyhow::bail!("capture thread panicked"),
+    if let Some(ctl) = controller {
+        ctl.stop();
+    }
+    if let Some(thread) = offline_thread {
+        match thread.join() {
+            Ok(capture_result) => capture_result.context("capture failed")?,
+            Err(_) => anyhow::bail!("capture thread panicked"),
+        }
     }
     tracing::info!(
         frames = stats.frames.load(Ordering::Relaxed),
@@ -132,10 +136,31 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// Rafraîchit l'état partagé interfaces disponibles + interface active.
+fn refresh_iface_state(ctl: &capture::Controller, iface_state: &Arc<Mutex<IfaceState>>) {
+    let interfaces = capture::list_devices()
+        .map(|devices| {
+            devices
+                .iter()
+                .map(|d| IfaceInfo {
+                    id: d.name.clone(),
+                    label: capture::device_label(d),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(mut state) = iface_state.lock() {
+        state.current = ctl.current();
+        state.interfaces = interfaces;
+    }
+}
+
 async fn async_main(
     cli: &Cli,
     stats: Arc<CaptureStats>,
     meta_rx: mpsc::Receiver<PacketMeta>,
+    controller: Option<Arc<capture::Controller>>,
+    iface_state: Arc<Mutex<IfaceState>>,
 ) -> anyhow::Result<()> {
     let tables = Arc::new(Mutex::new(Tables::new()));
     let (deltas_tx, _) = broadcast::channel::<Utf8Bytes>(BROADCAST_CAPACITY);
@@ -152,10 +177,24 @@ async fn async_main(
         Arc::clone(&fade_secs),
     ));
 
+    // Bascule d'interface pilotée depuis le navigateur (mode live seulement).
+    let iface_tx = controller.map(|ctl| {
+        let (iface_tx, iface_rx) = mpsc::channel::<String>(8);
+        tokio::spawn(iface_switch_loop(
+            iface_rx,
+            ctl,
+            Arc::clone(&iface_state),
+            deltas_tx.clone(),
+        ));
+        iface_tx
+    });
+
     let state = AppState {
         tables,
         deltas_tx,
         fade_secs,
+        iface_state,
+        iface_tx,
     };
     let app = server::router(state, &cli.static_dir);
     let addr = format!("127.0.0.1:{}", cli.port);
@@ -172,6 +211,35 @@ async fn async_main(
         .await
         .context("http server failed")?;
     Ok(())
+}
+
+/// Applique les demandes de changement d'interface : stop + join de la boucle
+/// pcap courante puis démarrage sur la nouvelle carte (hors runtime via
+/// spawn_blocking), et rediffusion de l'état interfaces à tous les clients.
+async fn iface_switch_loop(
+    mut iface_rx: mpsc::Receiver<String>,
+    ctl: Arc<capture::Controller>,
+    iface_state: Arc<Mutex<IfaceState>>,
+    deltas_tx: broadcast::Sender<Utf8Bytes>,
+) {
+    while let Some(wanted) = iface_rx.recv().await {
+        let ctl_for_switch = Arc::clone(&ctl);
+        let switched = tokio::task::spawn_blocking(move || ctl_for_switch.switch_to(&wanted)).await;
+        match switched {
+            Ok(Ok(label)) => tracing::info!(label, "capture switched by client"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "interface switch failed"),
+            Err(e) => tracing::error!(error = %e, "interface switch task failed"),
+        }
+        // L'état diffusé reflète la réalité (échec ⇒ le sélecteur se recale).
+        refresh_iface_state(&ctl, &iface_state);
+        let message = match iface_state.lock() {
+            Ok(state) => server::encode_info(&state.to_message()),
+            Err(_) => None,
+        };
+        if let Some(msg) = message {
+            let _ = deltas_tx.send(msg);
+        }
+    }
 }
 
 /// Agrégateur : consomme les PacketMeta par lots, maintient les tables,
