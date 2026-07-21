@@ -37,6 +37,10 @@ struct Cli {
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
+    /// HTTP/WebSocket listen address (0.0.0.0 to allow LAN access)
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: String,
+
     /// Fade timeout in seconds: nodes/edges unseen for this long are removed
     #[arg(long, default_value_t = 60)]
     fade: u64,
@@ -198,11 +202,14 @@ async fn async_main(
         iface_tx,
     };
     let app = server::router(state, &cli.static_dir);
-    let addr = format!("127.0.0.1:{}", cli.port);
+    let addr = format!("{}:{}", cli.listen, cli.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     println!("Serving on http://{addr} (Ctrl-C to stop)");
+    if cli.listen != "127.0.0.1" {
+        println!("Reachable from the network — mind your firewall rules.");
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

@@ -60,6 +60,8 @@ Le binaire est `target\release\netman.exe`. Il sert le dossier `static\`
 
 # Options :
 #   --port <n>        port HTTP/WebSocket (défaut 8080)
+#   --listen <addr>   adresse d'écoute (défaut 127.0.0.1 ; 0.0.0.0 pour un
+#                     accès depuis le réseau — prévoir la règle pare-feu)
 #   --fade <s>        délai initial de disparition des nœuds muets (défaut 60 s)
 #   --static-dir <d>  dossier du frontend (défaut "static")
 ```
